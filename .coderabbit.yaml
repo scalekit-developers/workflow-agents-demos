@@ -1,0 +1,70 @@
+reviews:
+  pre_merge_checks:
+    # Built-ins (examples; keep or adjust)
+    docstrings:
+      mode: "error"
+      threshold: 80
+    title:
+      mode: "warning"
+      requirements: "Imperative verb; clear scope; include sample type (sample-app | code-example | gist)"
+    description:
+      mode: "warning"
+      requirements: "What/Why/How tested; list features demonstrated (FSA, SSO, SCIM, webhooks, etc.)"
+
+    custom_checks:
+      - name: "Repo type declared"
+        mode: "warning"
+        instructions: |
+          - README must include a frontmatter or top section line: sample_type: sample-app | code-example | gist
+          - Use this declaration to apply the right depth of documentation and testing expectations
+
+      - name: "Copy-paste readiness"
+        mode: "error"
+        instructions: |
+          - Provide a minimal Quickstart with 1) prerequisites, 2) setup, 3) run, 4) verify steps that work from a clean clone
+          - Include a .env.example with all required variables and safe placeholders (no real secrets)
+          - Ensure defaults are secure and reasonable (e.g., localhost ports, dev callbacks)
+
+      - name: "ScaleKit feature mapping"
+        mode: "warning"
+        instructions: |
+          - README must enumerate Features Demonstrated (FSA, SSO, SCIM, webhooks, passwordless, org switcher, etc.)
+          - Each feature should link to the relevant code entry points and explain expected behavior
+
+      - name: "SDK version & deprecations"
+        mode: "warning"
+        instructions: |
+          - Pin to latest stable ScaleKit SDK for the language and avoid deprecated APIs
+          - Note `Last verified on: <date>` and `SDK versions: <list>` in README
+
+      - name: "Security hygiene (samples)"
+        mode: "error"
+        instructions: |
+          - No hardcoded credentials, tokens, or secrets
+          - Use environment variables and clearly document required values in .env.example
+          - Avoid logging tokens or PII in examples
+
+      - name: "Auth flow correctness"
+        mode: "warning"
+        instructions: |
+          - Demonstrate proper session/token validation and error handling (401/403 paths)
+          - Include an example protected endpoint/page and a failing/unauthorized path demonstration
+          - For webhooks, show signature verification and idempotency handling
+
+      - name: "Docs structure"
+        mode: "warning"
+        instructions: |
+          - README sections: Overview, Features Demonstrated, Architecture (diagram optional), Prerequisites, Setup, Configuration (.env variables), Run, Verify, Troubleshooting
+          - For code examples, keep narrow scope; for sample apps, include end‑to‑end steps; for gists, include usage and limitations
+
+      - name: "Sample simplicity"
+        mode: "warning"
+        instructions: |
+          - Prefer clarity over abstraction: minimal dependencies, obvious file layout, inline comments at integration points
+          - Avoid premature layering; keep auth integration paths easy to trace
+
+      - name: "Release alignment"
+        mode: "warning"
+        instructions: |
+          - If a ScaleKit feature GA/changes, update sample within one iteration and note compatibility in README
+          - Flag mismatches between README claims and actual implemented features
