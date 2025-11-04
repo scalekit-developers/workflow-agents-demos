@@ -1,0 +1,21 @@
+# Python virtual environments
+.venv/
+__pycache__/
+
+# Environment files
+.env
+
+
+# Jupyter and notebook checkpoints
+.ipynb_checkpoints/
+
+# OS and editor files
+.DS_Store
+*.swp
+
+# Logs and temp
+*.log
+*.tmp
+
+# VSCode
+.vscode/
