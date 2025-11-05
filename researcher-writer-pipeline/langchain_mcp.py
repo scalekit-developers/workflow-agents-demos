@@ -107,6 +107,17 @@ async def run_langchain_mcp(query: str):
     return {"research_notes": notes, "summary": summary}
 
 
+# === MCP INTEGRATION INSTRUCTIONS ===
+# To integrate Model Context Protocol (MCP) in this pipeline:
+# 1. Install the MCP client library (see https://modelcontextprotocol.org/)
+# 2. Import MCPClient and initialize it with your model/context settings
+# 3. Use MCPClient to manage context, agent communication, or replace the LLM orchestration
+# Example:
+#   from mcp import MCPClient
+#   mcp_client = MCPClient(api_key=os.getenv("MCP_API_KEY"), model="gpt-4o-mini")
+#   result = mcp_client.run({"query": args.query})
+# You can replace the LLM calls or tool orchestration with MCPClient for advanced context management.
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LangChain Researcher→Writer pipeline")
     parser.add_argument("--query", default="What are the latest advancements in AI?", help="User query to research and summarize")

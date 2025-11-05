@@ -90,5 +90,24 @@ See `.env.example` for required keys:
 - If LLM calls fail, check your `OPENAI_API_KEY` in `.env`.
 - For tool errors, ensure all dependencies are installed and environment variables are loaded.
 
+## MCP Integration
+
+You can easily extend this pipeline to use Model Context Protocol (MCP) for advanced context management and agent orchestration.
+
+### How to Integrate MCP
+1. Install the MCP client library (see https://modelcontextprotocol.org/)
+2. Import MCPClient and initialize it with your model/context settings
+3. Use MCPClient to manage context, agent communication, or replace the LLM orchestration
+
+#### Example:
+```python
+from mcp import MCPClient
+mcp_client = MCPClient(api_key=os.getenv("MCP_API_KEY"), model="gpt-4o-mini")
+result = mcp_client.run({"query": "Your research topic here"})
+```
+You can replace the LLM calls or tool orchestration with MCPClient for advanced context management.
+
+Add `MCP_API_KEY` to your `.env` file if required.
+
 ## License
 MIT
