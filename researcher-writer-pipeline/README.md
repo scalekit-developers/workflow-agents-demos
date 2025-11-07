@@ -34,18 +34,17 @@ SERPAPI_API_KEY=your-serpapi-key
 
 ### 3. Run LangChain pipeline
 ```sh
-python langchain_mcp.py --query "Your research topic here" --timeout 90
+python langchain_mcp.py --query "Your research topic here"
 ```
 
 ### 4. Run CrewAI pipeline
 ```sh
-python crewai_mcp.py --query "Your research topic here" --timeout 90
+python crewai_mcp.py --query "Your research topic here"
 ```
 
 ## Tools
 - `web_search_tool`: Searches Google via SerpAPI and returns top results.
 - `fetch_url_tool`: Fetches and extracts main readable content from a URL.
-- `summarize_tool`: Summarizes research notes into a concise Markdown brief.
 
 ## File Structure
 ```
@@ -55,7 +54,6 @@ researcher-writer-pipeline/
 ├── tools/
 │   ├── web_search.py       # Web search tool
 │   ├── fetch_url.py        # Fetch URL tool
-│   ├── summarize_research.py # Summarizer tool
 │   └── crewai_tools.py     # CrewAI tool wrappers
 ├── requirements.txt        # Python dependencies
 ├── .env.example           # Environment variable template
@@ -83,7 +81,6 @@ See `.env.example` for required keys:
 ## Customization
 - Change the query/topic via CLI: `--query "Your topic"`
 - Override agent prompts: `--researcher-system "..." --writer-system "..."`
-- Adjust timeouts: `--timeout 90`
 
 ## Troubleshooting
 - If web search returns a configuration error, check your `SERPAPI_API_KEY` in `.env`.

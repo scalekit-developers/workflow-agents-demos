@@ -25,36 +25,7 @@ from crewai import Crew, Agent, Task, LLM
 import argparse
 from dotenv import load_dotenv
 import os
-
-# Define Researcher Agent (no tools)
-researcher = Agent(
-    role="Researcher",
-    goal="Find and synthesize the most relevant information for a given query.",
-    backstory="An expert at web research and summarization.",
-    verbose=True,
-)
-
-# Define Writer Agent (no tools)
-writer = Agent(
-    role="Writer",
-    goal="Transform research notes into a concise, publishable Markdown brief.",
-    backstory="A skilled technical writer who creates clear, engaging summaries.",
-    verbose=True,
-)
-
-# Define Research Task
-research_task = Task(
-    description="Research the query and synthesize findings with citations.",
-    agent=researcher,
-    expected_output="A summary with 3-5 key findings and cited URLs."
-)
-
-# Define Writing Task
-writing_task = Task(
-    description="Rewrite research notes into a Markdown brief with heading, bullet points, and conclusion.",
-    agent=writer,
-    expected_output="A ready-to-publish Markdown brief."
-)
+from tools.crewai_tools import crew_web_search_tool, crew_fetch_url_tool
 
 def main():
     load_dotenv()
@@ -65,8 +36,43 @@ def main():
     # Set up CrewAI LLM using environment variable
     openai_api_key = os.getenv("OPENAI_API_KEY")
     llm = LLM(model="gpt-4o-mini", api_key=openai_api_key)
-    researcher.llm = llm
-    writer.llm = llm
+
+    # Define agents AFTER LLM is created and env is loaded
+    researcher = Agent(
+        role="Researcher",
+        goal="Find and synthesize the most relevant information for a given query.",
+        backstory="An expert at web research and summarization.",
+        tools=[crew_web_search_tool, crew_fetch_url_tool],
+        llm=llm,
+        verbose=True,
+    )
+
+    writer = Agent(
+        role="Writer",
+        goal="Transform research notes into a concise, publishable Markdown brief.",
+        backstory="A skilled technical writer who creates clear, engaging summaries.",
+        llm=llm,
+        verbose=True,
+    )
+
+    # Define tasks (research uses query input)
+    research_task = Task(
+        description=(
+            "Use web_search_tool and fetch_url_tool to research the given query. "
+            "Summarize 3-5 key findings and include cited URLs. Query: {query}"
+        ),
+        agent=researcher,
+        expected_output="A summary with 3-5 key findings and cited URLs.",
+        input_keys=["query"],
+    )
+
+    writing_task = Task(
+        description=(
+            "Rewrite the research notes into a Markdown brief with a heading, bullet points, and a short conclusion."
+        ),
+        agent=writer,
+        expected_output="A ready-to-publish Markdown brief.",
+    )
 
     crew = Crew(
         agents=[researcher, writer],
@@ -76,7 +82,7 @@ def main():
 
     result = crew.kickoff({"query": args.query})
     print("\n✅ Final Writer Output (CrewAI):\n")
-    print(result)
+    print(str(result))
 
 if __name__ == "__main__":
     main()
