@@ -3,7 +3,7 @@
 This folder demonstrates three ways to handle HubSpot OAuth tokens and show an intentional expiry/refresh flow.
 
 ## Files
-- `naive_env_mail_agent.py` — Direct HubSpot OAuth usage. Reads an access token from `.env`, tries a call, and if it fails (401/403) it refreshes using refresh_token and retries.
+- `naive_agent.py` — Direct HubSpot OAuth usage. Reads an access token from `.env`, tries a call, and if it fails (401/403) it refreshes using refresh_token and retries.
 - `hubspot_langchain_flow.py` — A LangChain Runnable pipeline that orchestrates: initial fetch → wait N seconds → simulate expiry → fetch again (triggers refresh). Uses the functions in the naïve script under the hood.
 - `scalekit_hubspot_flow.py` — Same flow but with tokens managed by a ScaleKit OAuth endpoint (SCALEKIT_TOKEN_URL). On 401/403, refreshes via ScaleKit and retries, optionally persisting rotated tokens to `.env`.
 - `.env` — Place HubSpot and (optionally) ScaleKit credentials here.
@@ -11,6 +11,7 @@ This folder demonstrates three ways to handle HubSpot OAuth tokens and show an i
 
 ## Setup
 ```bash
+cd secure-token-agents 
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
@@ -30,7 +31,7 @@ Optional knobs:
 - SIMULATE_EXPIRE_DELAY=60        # used by flows to wait before simulating expiry
 
 For ScaleKit flow (replace with your tenant details):
-- SCALEKIT_TOKEN_URL=https://auth.scalekit.com/oauth/token
+- SCALEKIT_TOKEN_URL=https://hey.scalekit.dev
 - SCALEKIT_CLIENT_ID=
 - SCALEKIT_CLIENT_SECRET=
 - SCALEKIT_REFRESH_TOKEN=
@@ -39,19 +40,19 @@ For ScaleKit flow (replace with your tenant details):
 
 Naïve one-shot call (will refresh on 401/403 and retry):
 ```bash
-python secure-token-agents/naive_env_mail_agent.py
+python naive_agent.py
 ```
 
 LangChain flow demo (initial fetch → wait → simulate → refresh → fetch):
 ```bash
 # quick demo
-SIMULATE_EXPIRE_DELAY=3 python secure-token-agents/hubspot_langchain_flow.py
+SIMULATE_EXPIRE_DELAY=3 python hubspot_langchain_flow.py
 ```
 
 ScaleKit-managed flow (ScaleKit-only; no fallback):
 ```bash
 # quick demo (requires ScaleKit env vars below)
-SIMULATE_EXPIRE_DELAY=3 python secure-token-agents/scalekit_hubspot_flow.py
+SIMULATE_EXPIRE_DELAY=3 python scalekit_hubspot_flow.py
 ```
 
 ## What this shows
@@ -63,7 +64,7 @@ If your ScaleKit config rotates refresh tokens, the demo persists them back to `
 
 ## ScaleKit-only setup (no fallback)
 Set these in `secure-token-agents/.env` for the ScaleKit flow:
-- SCALEKIT_TOKEN_URL: Your ScaleKit OAuth token endpoint (example: https://auth.scalekit.com/oauth/token)
+- SCALEKIT_TOKEN_URL: Your ScaleKit OAuth token endpoint (example: https://hey.scalekit.dev)
 - SCALEKIT_CLIENT_ID: Client ID from your ScaleKit app
 - SCALEKIT_CLIENT_SECRET: Client Secret from your ScaleKit app
 - SCALEKIT_REFRESH_TOKEN: Refresh token issued by ScaleKit that maps to your HubSpot connection
@@ -74,6 +75,3 @@ Where to get them in ScaleKit:
 - Connect/authorize HubSpot for your account/tenant inside ScaleKit to obtain a refresh token.
 - Copy the OAuth token endpoint URL for your environment (Prod/Dev) as SCALEKIT_TOKEN_URL.
 
-Notes:
-- This demo uses the standard OAuth refresh grant against SCALEKIT_TOKEN_URL and expects an `access_token` (and optionally `refresh_token`) in the response.
-- The flow will error if any of the SCALEKIT_* vars are missing — there is no native HubSpot fallback.

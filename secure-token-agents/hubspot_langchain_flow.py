@@ -16,7 +16,7 @@ import os
 import time
 from typing import Any, Dict
 
-from naive_env_mail_agent import (
+from naive_agent import (
     access_token,
     fetch_data,
     simulate_expired_access_token,
