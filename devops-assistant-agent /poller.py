@@ -10,9 +10,27 @@ import datetime as dt
 from typing import Dict, Any, List, Set
 from settings import Settings
 from sk_connectors import get_connector
-import threading
+import os
+import json
+
+
+LINEAR_IDENTIFIER = os.getenv("LINEAR_IDENTIFIER", "")
+SLACK_IDENTIFIER = os.getenv("SLACK_IDENTIFIER", "")
+GITHUB_IDENTIFIER = os.getenv("GITHUB_IDENTIFIER", "")
+
+if not LINEAR_IDENTIFIER or not SLACK_IDENTIFIER or not GITHUB_IDENTIFIER:
+    raise ValueError("LINEAR_IDENTIFIER, SLACK_IDENTIFIER, and GITHUB_IDENTIFIER must be set in .env")
+
+POLL_INTERVAL = 30  # seconds
+
 
 # --- Digest helpers (from digest.py) ---
+
+# Tools used (via Scalekit execute_tool):
+# github_pull_requests_list – list open PRs
+# linear_issue_create – create Linear issue
+# slack_send_message – optional notifications
+
 def list_open_prs_digest(identifier) -> List[Dict[str, Any]]:
     conn = get_connector()
     owner, repo = Settings.GITHUB_REPO_OWNER, Settings.GITHUB_REPO_NAME
@@ -71,19 +89,6 @@ def post_slack_digest(identifier, text: str):
         print(f"[poller] Slack digest send result: {result}")
     except Exception as e:
         print(f"[poller] Slack digest send error: {e}")
-
-import os
-LINEAR_IDENTIFIER = os.getenv("LINEAR_IDENTIFIER", "")
-SLACK_IDENTIFIER = os.getenv("SLACK_IDENTIFIER", "")
-GITHUB_IDENTIFIER = os.getenv("GITHUB_IDENTIFIER", "")
-if not LINEAR_IDENTIFIER or not SLACK_IDENTIFIER or not GITHUB_IDENTIFIER:
-    raise ValueError("LINEAR_IDENTIFIER, SLACK_IDENTIFIER, and GITHUB_IDENTIFIER must be set in .env")
-POLL_INTERVAL = 30  # seconds
-
-# Tools used (via Scalekit execute_tool):
-# github_pull_requests_list – list open PRs
-# linear_issue_create – create Linear issue
-# slack_send_message – optional notifications
 
 def fetch_open_prs() -> List[Dict[str, Any]]:
     conn = get_connector()
@@ -195,10 +200,7 @@ def loop_once():
 def run_forever():
     print("▶️  DevOps poller started (Scalekit-only). Press Ctrl+C to stop.")
     last_digest_day = None
-    # Load pr_linear_links.json for digest
-    import json
-    import os as _os
-    state_path = _os.path.join(_os.path.dirname(__file__), "state", "pr_linear_links.json")
+    state_path = os.path.join(os.path.dirname(__file__), "state", "pr_linear_links.json")
     def load_pr_linear_links():
         try:
             with open(state_path, "r") as f:
