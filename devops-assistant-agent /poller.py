@@ -168,7 +168,7 @@ def format_digest(prs: List[Dict[str, Any]], pr_linear_links: dict) -> str:
         return "Daily DevOps Digest:\n- No open PRs."
 
     lines = ["Daily DevOps Digest:"]
-    today = dt.datetime.utcnow().date()
+    today = dt.datetime.now(dt.timezone.utc).date()
 
     for pr in prs:
         try:
@@ -434,7 +434,7 @@ def run_forever() -> None:
         try:
             loop_once()
 
-            now = dt.datetime.utcnow()
+            now = dt.datetime.now(dt.timezone.utc)
             today = now.date()
             if last_digest_day != today:
                 log.info("Sending daily Slack digest...")
