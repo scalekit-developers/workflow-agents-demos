@@ -48,10 +48,12 @@ class ColorFormatter(logging.Formatter):
     RESET = "\033[0m"
 
     def __init__(self, fmt: str, datefmt: str, colorize: bool):
+        """Initialize formatter with optional ANSI colorization."""
         super().__init__(fmt, datefmt)
         self.colorize = colorize
 
     def format(self, record: logging.LogRecord) -> str:
+        """Format a log record, wrapping with ANSI color codes when colorize is True."""
         message = super().format(record)
         if not self.colorize:
             return message
@@ -60,6 +62,7 @@ class ColorFormatter(logging.Formatter):
 
 
 def setup_logging() -> logging.Logger:
+    """Configure the root poller logger with color console output and a rotating file handler."""
     logger = logging.getLogger("poller")
     logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
     logger.propagate = False
@@ -164,6 +167,11 @@ def list_open_prs_digest(identifier: str) -> List[Dict[str, Any]]:
 
 
 def format_digest(prs: List[Dict[str, Any]], pr_linear_links: dict) -> str:
+    """Format a list of open PRs into a Slack-ready digest string.
+
+    Marks PRs as stale when last updated more than DIGEST_STALE_DAYS ago.
+    Appends linked Linear issue IDs from the idempotency store.
+    """
     if not prs:
         return "Daily DevOps Digest:\n- No open PRs."
 
@@ -202,6 +210,7 @@ def format_digest(prs: List[Dict[str, Any]], pr_linear_links: dict) -> str:
 
 
 def post_slack_digest(identifier: str, text: str) -> None:
+    """Send the formatted digest string to the configured Slack channel via Scalekit Actions."""
     try:
         conn = get_connector()
     except Exception:
@@ -274,10 +283,12 @@ def fetch_open_prs() -> List[Dict[str, Any]]:
 
 
 def build_label_key(full_name: str, number: int, label: str) -> str:
+    """Build a normalized idempotency key for a PR + label combination."""
     return f"{full_name}#{number}:{label}".lower()
 
 
 def process_labels(pr: Dict[str, Any], existing_keys: Set[str]) -> None:
+    """Process all labels on a single PR, creating Linear issues for any not yet linked."""
     try:
         conn = get_connector()
     except Exception:
@@ -309,6 +320,7 @@ def process_labels(pr: Dict[str, Any], existing_keys: Set[str]) -> None:
 
 
 def _process_single_label(conn, full_name: str, number: Any, title: str, url: str, label: str) -> None:
+    """Create a Linear issue for one PR+label pair if not already tracked, then notify Slack."""
     key = build_label_key(full_name, number, label)
 
     try:
@@ -394,6 +406,7 @@ def _process_single_label(conn, full_name: str, number: Any, title: str, url: st
 
 
 def loop_once() -> None:
+    """Run one full poll cycle: fetch PRs and process labels for each."""
     prs = fetch_open_prs()
     existing: Set[str] = set()  # placeholder; connector handles per-key checks
     log.info("Looping over %d PR(s)...", len(prs))
@@ -411,6 +424,7 @@ def loop_once() -> None:
 
 
 def load_pr_linear_links() -> dict:
+    """Load the PR-to-Linear-issue mapping from the state file, returning {} on any error."""
     try:
         with open(STATE_PATH, "r") as f:
             return json.load(f)
@@ -426,6 +440,7 @@ def load_pr_linear_links() -> dict:
 
 
 def run_forever() -> None:
+    """Run the polling loop indefinitely, posting a daily digest once per calendar day."""
     log.info("DevOps poller started (Scalekit-only). Press Ctrl+C to stop.")
     last_digest_day = None
 

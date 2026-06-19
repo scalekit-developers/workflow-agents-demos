@@ -46,6 +46,7 @@ class Settings:
 
     @classmethod
     def validate(cls) -> None:
+        """Raise ValueError listing all missing required env vars before any API call is made."""
         required = {
             "SCALEKIT_ENV_URL": cls.SCALEKIT_ENV_URL,
             "SCALEKIT_CLIENT_ID": cls.SCALEKIT_CLIENT_ID,

@@ -83,8 +83,8 @@ logs/
 ### 1. Clone and set up the environment
 
 ```bash
-git clone https://github.com/scalekit-inc/workflow-agent-demos
-cd workflow-agent-demos/devops-assistant-agent
+git clone https://github.com/scalekit-developers/workflow-agents-demos
+cd workflow-agents-demos/devops-assistant-agent
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
@@ -115,6 +115,38 @@ You should see colored log output like:
 ```
 
 Press **Ctrl+C** to stop cleanly.
+
+### 4. Verify
+
+Check these after the first poll cycle completes:
+
+- **Log output** — you should see `Found N open PR(s).` and `Already linked Linear issue...` or `Recorded Linear issue...` for each labeled PR.
+- **State file** — `state/pr_linear_links.json` should exist and contain entries like `{"owner/repo#2:label": {"linear_issue_id": "..."}}`
+- **Log file** — `logs/poller.log` should be created and match the console output.
+- **Linear** — open your Linear team and confirm issues exist for any labeled PRs.
+- **Slack** — check the configured channel for the daily digest message (sent once per calendar day on startup).
+
+If Slack sends fail, look for `AUTH EXPIRED` in the logs — the agent prints a re-authorization link automatically.
+
+---
+
+## Features Demonstrated
+
+| Scalekit Feature | Where in code |
+|---|---|
+| Agent Actions tool-calling | `sk_connectors.py` — `execute_tool()` calls `client.actions.execute_tool()` |
+| Delegated OAuth (no hardcoded tokens) | `sk_connectors.py` — credentials loaded from env vars only, never in agent code |
+| Connected accounts by identifier | `settings.py` — `GITHUB_IDENTIFIER`, `LINEAR_IDENTIFIER`, `SLACK_IDENTIFIER` |
+| Connection name pinning | `settings.py` — `*_CONNECTION_NAME` vars passed to every `execute_tool` call |
+| Auth expiry detection + re-auth link | `sk_connectors.py` — `_maybe_generate_auth_link()` auto-generates magic link on `invalid_auth` |
+| Token lifecycle (no refresh code) | Scalekit handles refresh automatically — same `execute_tool` call works on day 1 or day 180 |
+
+---
+
+## SDK versions
+
+- `scalekit-sdk-python >= 2.12.0`
+- Last verified: 2026-06-19
 
 ---
 
