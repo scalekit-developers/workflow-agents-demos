@@ -21,20 +21,51 @@ This agent polls GitHub for open PRs, creates Linear issues when labels appear, 
 
 ## Architecture
 
-```
-poller.py          – Main loop: poll → label check → Linear create → Slack notify
-settings.py        – Env var loading and validation (fails fast on missing vars)
-sk_connectors.py   – ScalekitClient wrapper with retry/backoff and idempotency store
-state/
-  pr_linear_links.json  – Local file tracking PR+label → Linear issue ID (prevents duplicates)
-logs/
-  poller.log       – Rotating log file (2 MB × 5 backups)
+```mermaid
+flowchart TD
+    A([poller.py\nruns every 30s]) --> B[fetch_open_prs\ngithub_pull_requests_list]
+    B --> C{New label\non PR?}
+
+    C -- No --> D([wait 30s\nthen poll again])
+    C -- Yes --> E{Already in\npr_linear_links.json?}
+
+    E -- Yes --> D
+    E -- No --> F[linear_issue_create\nvia Scalekit Actions]
+
+    F --> G[Save PR + label\nto pr_linear_links.json\nidempotency store]
+    G --> H[slack_send_message\nLinked issue notify\nvia Scalekit Actions]
+
+    A --> I{Once per\ncalendar day?}
+    I -- Yes --> J[format_digest\nstale detection + Linear IDs]
+    J --> K[slack_send_message\nDaily digest\nvia Scalekit Actions]
+
+    B & F & H & K --> SC[(Scalekit\nActions API)]
+    SC --> GH([GitHub])
+    SC --> LN([Linear])
+    SC --> SL([Slack])
+
+    style SC fill:#6366f1,color:#fff
+    style GH fill:#24292e,color:#fff
+    style LN fill:#5e6ad2,color:#fff
+    style SL fill:#4a154b,color:#fff
 ```
 
 **Tools used via Scalekit Actions:**
 - `github_pull_requests_list` — list open PRs
 - `linear_issue_create` — create a Linear issue
 - `slack_send_message` — send a Slack message
+
+**File map:**
+
+```
+poller.py          Main loop: poll, label check, Linear create, Slack notify
+settings.py        Env var loading and validation (fails fast on missing vars)
+sk_connectors.py   ScalekitClient wrapper: retry, connection pinning, auth expiry
+state/
+  pr_linear_links.json   Idempotency store: PR+label -> Linear issue ID
+logs/
+  poller.log             Rotating log file (2 MB x 5 backups)
+```
 
 ---
 
