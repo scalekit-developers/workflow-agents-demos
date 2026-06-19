@@ -1,328 +1,379 @@
-
 import os
+import sys
 import json
 import time
 import logging
-import requests
-from settings import (
-    ZENDESK_API_TOKEN, ZENDESK_EMAIL, ZENDESK_SUBDOMAIN,
-    SLACK_BOT_TOKEN, SLACK_CHANNEL_ID,
-    NOTION_API_KEY, NOTION_KB_DATABASE_ID, LOG_LEVEL,
-)
-from google.adk.agents import LlmAgent
-from google.adk import runners
-from google.genai import types as genai_types
-import asyncio
 from typing import List, Dict, Any
-logging.basicConfig(level=LOG_LEVEL)
-logger = logging.getLogger("zendesk-slack-notion-agent")
+
+from scalekit import ScalekitClient
+from google import genai as _genai
+
+import settings
+settings.validate()
 
 if os.getenv("GOOGLE_ADK_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
     os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_ADK_API_KEY")
 
+# ---------------------------------------------------------------------------
+# Colored logger
+# ---------------------------------------------------------------------------
+
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+RED    = "\033[91m"
+GREEN  = "\033[92m"
+YELLOW = "\033[93m"
+CYAN   = "\033[96m"
+WHITE  = "\033[97m"
+GREY   = "\033[90m"
+
+LEVEL_COLORS = {
+    "DEBUG":    GREY,
+    "INFO":     CYAN,
+    "WARNING":  YELLOW,
+    "ERROR":    RED,
+    "CRITICAL": RED + BOLD,
+}
+
+STEP_ICONS = {
+    "fetch":   "↓",
+    "reply":   "✦",
+    "slack":   "→",
+    "notion":  "◈",
+    "start":   "▶",
+    "done":    "✔",
+    "skip":    "–",
+    "warn":    "⚠",
+    "error":   "✖",
+}
+
+
+class ColorFormatter(logging.Formatter):
+    """Format log records with ANSI colors when writing to a TTY."""
+
+    def __init__(self, colorize: bool = True):
+        """Initialize formatter, enabling ANSI colors only when output is a TTY."""
+        super().__init__()
+        self.colorize = colorize
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Format a log record with optional ANSI color codes."""
+        ts    = self.formatTime(record, "%H:%M:%S")
+        level = record.levelname
+        msg   = record.getMessage()
+
+        if not self.colorize:
+            return f"{ts} | {level:<8} | {msg}"
+
+        col = LEVEL_COLORS.get(level, WHITE)
+        ts_str    = f"{GREY}{ts}{RESET}"
+        level_str = f"{col}{BOLD}{level:<8}{RESET}"
+        msg_str   = f"{WHITE}{msg}{RESET}" if level == "INFO" else f"{col}{msg}{RESET}"
+        return f"{ts_str} {DIM}|{RESET} {level_str} {DIM}|{RESET} {msg_str}"
+
+
+class _NoiseFilter(logging.Filter):
+    _SKIP = ("AFC is enabled",)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not any(s in record.getMessage() for s in self._SKIP)
+
+
+def _setup_logging() -> None:
+    """Configure root logger with color console output; suppress noisy third-party loggers."""
+    is_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(ColorFormatter(colorize=is_tty))
+    handler.addFilter(_NoiseFilter())
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, settings.LOG_LEVEL, logging.INFO))
+    root.handlers = [handler]
+    for noisy in ("httpx", "httpcore", "google.adk", "grpc", "urllib3",
+                  "google.genai", "google.generativeai"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+_setup_logging()
+logger = logging.getLogger("support-agent")
+
+
+def _banner() -> None:
+    """Print a startup banner to stdout."""
+    tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+    if tty:
+        line = f"{CYAN}{BOLD}{'─' * 58}{RESET}"
+        print(line)
+        print(f"{CYAN}{BOLD}  Support Ticket Automation Agent{RESET}")
+        print(f"{GREY}  Zendesk → Gemini → Slack → Notion via Scalekit Actions{RESET}")
+        print(line)
+        print(f"  {GREY}Environment :{RESET} {WHITE}{settings.SCALEKIT_ENV_URL}{RESET}")
+        print(f"  {GREY}Model       :{RESET} {WHITE}{settings.GOOGLE_ADK_MODEL}{RESET}")
+        print(f"  {GREY}Poll every  :{RESET} {WHITE}{settings.POLL_INTERVAL}s{RESET}")
+        print(f"  {GREY}State file  :{RESET} {WHITE}state/ticket_thread_map.json{RESET}")
+        print(line)
+        print(f"  {YELLOW}Press Ctrl+C to stop.{RESET}")
+        print(line)
+        print()
+    else:
+        print("Support Ticket Automation Agent starting...")
+
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 
 STATE_FILE = "state/ticket_thread_map.json"
-def load_ticket_thread_map():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
+
+
+def _load_state() -> dict:
+    """Load idempotency map from disk, returning empty dict on any error."""
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                return json.load(f)
+    except Exception:
+        pass
     return {}
-def save_ticket_thread_map(mapping):
+
+
+def _save_state(mapping: dict) -> None:
+    """Persist the idempotency map to disk."""
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     with open(STATE_FILE, "w") as f:
-        json.dump(mapping, f)
-ticket_thread_map = load_ticket_thread_map()
+        json.dump(mapping, f, indent=2)
 
 
+ticket_thread_map = _load_state()
 
-# --- LLM Agent, session, and runner setup ---
-LLM_APP_NAME = "zendesk_slack_notion_agent"
-LLM_USER_ID = "zendesk"
-LLM_SESSION_ID = "suggested_reply"
+# ---------------------------------------------------------------------------
+# Scalekit client + Gemini client
+# ---------------------------------------------------------------------------
 
-suggested_reply_agent = LlmAgent(
-    model=os.getenv("GOOGLE_ADK_MODEL", "gemini-2.0-flash"),
-    name="suggested_reply_agent",
-    description="Generates a concise, friendly support reply for a Zendesk ticket.",
-    instruction=(
-        "You are a helpful support agent. Write only the suggested reply (do not include any explanation, meta-commentary, or bullet points). "
-        "The reply should be concise and friendly, ready to send to the customer. "
-        "Input will be a JSON object with 'subject' and 'description'. Respond with only the reply text."
-    ),
+sk = ScalekitClient(
+    env_url=settings.SCALEKIT_ENV_URL,
+    client_id=settings.SCALEKIT_CLIENT_ID,
+    client_secret=settings.SCALEKIT_CLIENT_SECRET,
 )
-_llm_session_service = runners.InMemorySessionService()
-try:
-    if asyncio.iscoroutinefunction(_llm_session_service.create_session):
-        _llm_session = asyncio.run(_llm_session_service.create_session(app_name=LLM_APP_NAME, user_id=LLM_USER_ID, session_id=LLM_SESSION_ID))
-    else:
-        _llm_session = _llm_session_service.create_session(app_name=LLM_APP_NAME, user_id=LLM_USER_ID, session_id=LLM_SESSION_ID)
-except Exception as e:
-    _llm_session = None
-    logger.exception(f"Failed to create LLM session: {e}")
-_llm_runner = runners.Runner(agent=suggested_reply_agent, app_name=LLM_APP_NAME, session_service=_llm_session_service)
 
-# --- Tool functions for the agent ---
-def fetch_new_tickets() -> dict:
-    url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets.json?status=new"
-    auth = (f"{ZENDESK_EMAIL}/token", ZENDESK_API_TOKEN)
-    logger.debug(f"Fetching new tickets from Zendesk: {url}")
+_genai_client = _genai.Client(api_key=settings.GOOGLE_API_KEY)
+
+
+def _generate_reply(ticket: dict) -> str:
+    """Call Gemini directly to draft a concise reply for one ticket."""
+    prompt = (
+        "You are a helpful support agent. Write only the suggested reply — no bullet points, "
+        "no meta-commentary. Keep it concise and ready to send to the customer.\n\n"
+        f"Subject: {ticket.get('subject', '')}\n"
+        f"Description: {ticket.get('description', '')}"
+    )
     try:
-        resp = requests.get(url, auth=auth)
-        resp.raise_for_status()
-        tickets = resp.json().get("tickets", [])
-        logger.debug(f"Fetched {len(tickets)} tickets: {tickets}")
+        resp = _genai_client.models.generate_content(
+            model=settings.GOOGLE_ADK_MODEL,
+            contents=prompt,
+        )
+        return resp.text.strip()
+    except Exception as exc:
+        short = str(exc).split("\n")[0][:120]
+        logger.warning("%s Reply generation failed for #%s: %s",
+                       STEP_ICONS["warn"], ticket.get("id"), short)
+    return "Thank you for reaching out! We are looking into your issue."
+
+
+# ---------------------------------------------------------------------------
+# Tool functions (exposed to ADK orchestrator)
+# ---------------------------------------------------------------------------
+
+def fetch_new_tickets() -> dict:
+    """Fetch new Zendesk tickets via Scalekit Actions and return a trimmed list."""
+    logger.info("%s  Fetching Zendesk tickets...", STEP_ICONS["fetch"])
+    try:
+        resp = sk.actions.execute_tool(
+            tool_name="zendesk_tickets_list",
+            identifier=settings.ZENDESK_IDENTIFIER,
+            connection_name=settings.ZENDESK_CONNECTION_NAME,
+            tool_input={"status": "new", "sort_by": "created_at", "sort_order": "asc"},
+        )
+        raw = (resp.data or {}).get("tickets", [])
+        # Keep only fields needed downstream; large payloads cause MALFORMED_FUNCTION_CALL
+        tickets = [
+            {
+                "id":          t.get("id"),
+                "subject":     t.get("subject", ""),
+                "description": t.get("description", ""),
+                "status":      t.get("status", ""),
+            }
+            for t in raw
+        ]
+        logger.info("%s  Fetched %d ticket(s) from Zendesk.", STEP_ICONS["done"], len(tickets))
         return {"tickets": tickets}
-    except Exception as e:
-        logger.exception(f"Error fetching tickets from Zendesk: {e}")
+    except Exception as exc:
+        logger.error("%s  Zendesk fetch failed: %s", STEP_ICONS["error"], exc)
         return {"tickets": []}
 
-def generate_suggested_reply(ticket: dict) -> dict:
-    logger.debug(f"Generating suggested reply for ticket: {ticket}")
-    try:
-        if _llm_runner is None:
-            logger.warning("LLM runner not initialized. Returning static reply.")
-            return {"suggested_reply": "Thank you for reaching out! We are looking into your issue."}
-        user_input = json.dumps({"subject": ticket.get("subject", ""), "description": ticket.get("description", "")})
-        content = genai_types.Content(role='user', parts=[genai_types.Part(text=user_input)])
-        events = _llm_runner.run(user_id=LLM_USER_ID, session_id=LLM_SESSION_ID, new_message=content)
-        reply = None
-        for event in events:
-            if hasattr(event, 'is_final_response') and event.is_final_response() and event.content:
-                reply = event.content.parts[0].text.strip()
-                break
-        if not reply:
-            logger.warning("No reply generated by LlmAgent. Returning static reply.")
-            reply = "Thank you for reaching out! We are looking into your issue."
-        return {"suggested_reply": reply}
-    except Exception as e:
-        logger.exception(f"Failed to generate suggested reply with LlmAgent: {e}")
-        return {"suggested_reply": "Thank you for reaching out! We are looking into your issue."}
 
 def annotate_tickets_with_replies(tickets: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-            """
-            Annotate each ticket with an LLM-generated suggested_reply and return updated tickets.
+    """Generate a Gemini-powered suggested reply for each ticket."""
+    if not tickets:
+        return {"tickets": []}
+    logger.info("%s  Generating replies for %d ticket(s) via Gemini...",
+                STEP_ICONS["reply"], len(tickets))
+    annotated = []
+    for t in tickets:
+        t = dict(t)
+        reply = _generate_reply(t)
+        t["suggested_reply"] = reply
+        logger.info("    #%s: %s", t["id"], reply[:80] + ("…" if len(reply) > 80 else ""))
+        annotated.append(t)
+    return {"tickets": annotated}
 
-            Args:
-                    tickets (List[Dict[str, Any]]): List of Zendesk ticket dicts.
 
-            OpenAPI schema:
-                parameters:
-                    tickets:
-                        type: array
-                        description: List of ticket objects to annotate
-                        minItems: 1
-                        items:
-                            type: object
-                            properties:
-                                id:
-                                    type: string
-                                    description: Zendesk ticket ID
-                                subject:
-                                    type: string
-                                    description: Ticket subject
-                                description:
-                                    type: string
-                                    description: Ticket description
-                            required:
-                                - id
-                                - subject
-                                - description
-
-            Returns:
-                    Dict[str, List[Dict[str, Any]]]: {"tickets": updated_tickets}
-            """
-            logger.debug(f"Annotating {len(tickets) if tickets else 0} tickets with suggested replies")
-            if not tickets:
-                    return {"tickets": []}
-            updated = []
-            for t in tickets:
-                    try:
-                            reply = generate_suggested_reply(t)
-                            t = dict(t)
-                            t["suggested_reply"] = reply.get("suggested_reply")
-                            updated.append(t)
-                    except Exception as e:
-                            logger.exception(f"Error annotating ticket {t.get('id')}: {e}")
-                            updated.append(t)
-            return {"tickets": updated}
-
-# --- Slack API helpers ---
 def post_slack_digest(context: dict) -> dict:
+    """Post a digest of new tickets to Slack. Each ticket is posted at most once."""
     tickets = context.get("tickets", [])
-    logger.debug(f"Preparing to post Slack digest for tickets: {tickets}")
-    new_tickets = []
-    for ticket in tickets:
-        ticket_id = str(ticket["id"])
-        if ticket_id in ticket_thread_map:
-            logger.info(f"Ticket {ticket_id} already posted to Slack digest; skipping.")
-            continue
-        new_tickets.append(ticket)
-    if not new_tickets:
-        logger.info("No new tickets for digest; skipping Slack digest.")
+    fresh = [t for t in tickets if str(t["id"]) not in ticket_thread_map]
+    if not fresh:
+        logger.info("%s  Slack digest skipped — all tickets already posted.", STEP_ICONS["skip"])
         return {"status": "skipped"}
-    url = "https://slack.com/api/chat.postMessage"
-    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}", "Content-Type": "application/json"}
-    blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": "Daily Support Digest", "emoji": True}},
-        {"type": "divider"}
+
+    lines = [
+        f"• #{t['id']}: {t.get('subject', 'No subject')}\n"
+        f"  _{t.get('suggested_reply', '')[:120]}_"
+        for t in fresh
     ]
-    for t in new_tickets:
-        ticket_url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{t['id']}"
-        subject = t.get('subject', 'No subject')
-        status = t.get('status', 'unknown').capitalize()
-        desc = t.get('description', '')
-        suggested_reply = t.get('suggested_reply', None)
-        text = f"*<{ticket_url}|{subject}>*\n*ID:* `{t['id']}`   *Status:* `{status}`\n_{desc}_"
-        if suggested_reply:
-            text += f"\n>*Suggested reply:* {suggested_reply}"
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": text
-            }
-        })
-        blocks.append({"type": "divider"})
-    data = {
-        "channel": SLACK_CHANNEL_ID,
-        "blocks": blocks,
-        "text": "Daily Support Digest"
-    }
-    logger.debug(f"Posting Slack digest with data: {data}")
+    text = "*New support tickets digest*\n\n" + "\n\n".join(lines)
+
+    logger.info("%s  Posting Slack digest (%d ticket(s))...", STEP_ICONS["slack"], len(fresh))
     try:
-        resp = requests.post(url, headers=headers, json=data)
-        resp.raise_for_status()
-        logger.info(f"Posted Slack digest. Slack response: {resp.text}")
-        for ticket in new_tickets:
-            ticket_id = str(ticket["id"])
-            ticket_thread_map[ticket_id] = "digest"
-        save_ticket_thread_map(ticket_thread_map)
+        sk.actions.execute_tool(
+            tool_name="slack_send_message",
+            identifier=settings.SLACK_IDENTIFIER,
+            connection_name=settings.SLACK_CONNECTION_NAME,
+            tool_input={"channel": settings.SLACK_SUPPORT_CHANNEL, "text": text},
+        )
+        for t in fresh:
+            ticket_thread_map[str(t["id"])] = "digest"
+        _save_state(ticket_thread_map)
+        logger.info("%s  Slack digest posted to %s.",
+                    STEP_ICONS["done"], settings.SLACK_SUPPORT_CHANNEL)
         return {"status": "posted"}
-    except Exception as e:
-        logger.exception(f"Slack API error: {e}")
-        return {"status": "error", "error": str(e)}
+    except Exception as exc:
+        logger.error("%s  Slack digest failed: %s", STEP_ICONS["error"], exc)
+        return {"status": "error", "error": str(exc)}
 
-# --- Notion API helpers ---
-def update_notion_kb(context: dict) -> dict:
+
+def _classify_ticket(subject: str) -> str:
+    """Return a simple category string from the ticket subject."""
+    s = subject.lower()
+    if any(w in s for w in ("login", "password", "auth", "account", "sign")):
+        return "Account"
+    if any(w in s for w in ("pay", "bill", "invoice", "charge", "refund")):
+        return "Billing"
+    if any(w in s for w in ("bug", "error", "crash", "broken", "fail")):
+        return "Bug"
+    if any(w in s for w in ("feature", "request", "suggestion", "improve")):
+        return "Feature Request"
+    return "General"
+
+
+def save_to_notion_kb(context: dict) -> dict:
+    """Save each ticket as a row in the Notion knowledge base."""
     tickets = context.get("tickets", [])
-    logger.debug(f"Preparing to update Notion KB for tickets: {tickets}")
-    updated = 0
-    for ticket in tickets:
-        ticket_id = str(ticket["id"])
-        if ticket.get('status') == 'solved':
-            notion_key = f"notion_{ticket_id}"
-            if notion_key in ticket_thread_map:
-                logger.info(f"Ticket {ticket_id} already updated in Notion; skipping.")
-                continue
-            url = "https://api.notion.com/v1/pages"
-            headers = {
-                "Authorization": f"Bearer {NOTION_API_KEY}",
-                "Notion-Version": "2022-06-28",
-                "Content-Type": "application/json"
-            }
-            name = f"Ticket {ticket['id']} - {ticket.get('subject', 'No subject')}"
-            status = ticket.get("status", "solved")
-            description = ticket.get("description", "")
-            resolution = ticket.get("resolution") or "Resolved."
-            zendesk_id = str(ticket.get("id", ""))
-            zendesk_link = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{zendesk_id}" if zendesk_id else ""
-            properties = {
-                "Name": {"title": [{"text": {"content": name}}]},
-                "status": {"status": {"name": status}},
-                "Zendesk Link": {"url": zendesk_link}
-            }
-            data = {
-                "parent": {"database_id": NOTION_KB_DATABASE_ID},
-                "properties": properties,
-                "children": [
-                    {
-                        "object": "block",
-                        "type": "paragraph",
-                        "paragraph": {
-                            "rich_text": [
-                                {"type": "text", "text": {"content": description}}
-                            ]
-                        }
-                    },
-                    {
-                        "object": "block",
-                        "type": "paragraph",
-                        "paragraph": {
-                            "rich_text": [
-                                {"type": "text", "text": {"content": resolution}}
-                            ]
-                        }
-                    }
-                ]
-            }
-            logger.debug(f"Posting to Notion with data: {data}")
-            try:
-                resp = requests.post(url, headers=headers, json=data)
-                resp.raise_for_status()
-                logger.info(f"Updated Notion KB for ticket {ticket['id']}")
-                ticket_thread_map[notion_key] = True
-                updated += 1
-                save_ticket_thread_map(ticket_thread_map)
-            except Exception as e:
-                logger.exception(f"Notion error response: {e}")
-    return {"updated": updated}
+    saved = 0
+    for t in tickets:
+        ticket_id  = str(t["id"])
+        notion_key = f"notion_{ticket_id}"
+        if notion_key in ticket_thread_map:
+            logger.info("%s  Ticket #%s already in Notion KB; skipping.",
+                        STEP_ICONS["skip"], ticket_id)
+            continue
 
-# --- Orchestrator LLM Agent ---
-ORCH_SESSION_ID = "orchestrator"
+        subject  = t.get("subject", f"Ticket {ticket_id}")
+        reply    = t.get("suggested_reply", "")
+        category = _classify_ticket(subject)
 
-orchestrator_agent = LlmAgent(
-    model=os.getenv("GOOGLE_ADK_MODEL", "gemini-2.0-flash"),
-    name="zendesk_slack_notion_orchestrator",
-    description="Orchestrates the Zendesk -> Slack -> Notion pipeline by calling tools in order.",
-    instruction=(
-        "You are the orchestrator for the support workflow.\n"
-        "Steps you must perform in order:\n"
-        "1) Call fetch_new_tickets to get a dict with key 'tickets'.\n"
-        "2) If there are tickets, call annotate_tickets_with_replies with the list of tickets.\n"
-        "3) Call post_slack_digest with the dict containing the updated 'tickets'.\n"
-        "4) Call update_notion_kb with the same dict so solved tickets are saved to Notion.\n"
-        "If there are no tickets, simply respond that there is nothing to process today."
-    ),
-    tools=[fetch_new_tickets, annotate_tickets_with_replies, post_slack_digest, update_notion_kb],
-)
-
-_orch_session_service = runners.InMemorySessionService()
-try:
-    if asyncio.iscoroutinefunction(_orch_session_service.create_session):
-        _orch_session = asyncio.run(
-            _orch_session_service.create_session(
-                app_name=LLM_APP_NAME, user_id=LLM_USER_ID, session_id=ORCH_SESSION_ID
-            )
-        )
-    else:
-        _orch_session = _orch_session_service.create_session(
-            app_name=LLM_APP_NAME, user_id=LLM_USER_ID, session_id=ORCH_SESSION_ID
-        )
-except Exception as e:
-    _orch_session = None
-    logger.exception(f"Failed to create orchestrator session: {e}")
-_orch_runner = runners.Runner(agent=orchestrator_agent, app_name=LLM_APP_NAME, session_service=_orch_session_service)
-
-
-
-def main():
-    logger.info("Starting Zendesk + Slack + Notion Google ADK Orchestrated workflow...")
-    while True:
+        logger.info("%s  Saving ticket #%s to Notion KB...", STEP_ICONS["notion"], ticket_id)
         try:
-            logger.debug("Starting ADK LlmAgent tool orchestration.")
-            user_prompt = "Run the end-to-end support workflow now."
-            content = genai_types.Content(role='user', parts=[genai_types.Part(text=user_prompt)])
-            events = _orch_runner.run(user_id=LLM_USER_ID, session_id=ORCH_SESSION_ID, new_message=content)
-            final_text = None
-            for event in events:
-                if hasattr(event, 'is_final_response') and event.is_final_response() and event.content:
-                    final_text = event.content.parts[0].text.strip()
-            if final_text:
-                logger.info(f"Orchestrator final answer: {final_text}")
-            logger.debug("ADK LlmAgent orchestration loop completed.")
-        except Exception as e:
-            logger.exception(f"Error in ADK Agent workflow: {e}")
-        time.sleep(60)
+            sk.actions.execute_tool(
+                tool_name="notion_database_insert_row",
+                identifier=settings.NOTION_IDENTIFIER,
+                connection_name=settings.NOTION_CONNECTION_NAME,
+                tool_input={
+                    "database_id": settings.NOTION_KB_DATABASE_ID,
+                    "properties": {
+                        "Name":      {"title": [{"text": {"content": f"#{ticket_id}: {subject}"}}]},
+                        "Ticket ID": {"number": int(float(ticket_id))},
+                        "Category":  {"select": {"name": category}},
+                        "Reply":     {"rich_text": [{"text": {"content": reply}}]},
+                    },
+                },
+            )
+            ticket_thread_map[notion_key] = True
+            _save_state(ticket_thread_map)
+            saved += 1
+            logger.info("%s  Notion KB row created for ticket #%s.", STEP_ICONS["done"], ticket_id)
+        except Exception as exc:
+            msg = str(exc)
+            # extract the readable Notion error message from the gRPC envelope
+            import re as _re
+            m = _re.search(r'"message":"([^"]+)"', msg)
+            short = m.group(1) if m else msg.split("\n")[0]
+            logger.error("%s  Notion save failed for ticket #%s: %s — "
+                         "create Name/Ticket ID/Category/Reply columns in the DB first.",
+                         STEP_ICONS["error"], ticket_id, short)
+    return {"saved": saved}
+
+
+# ---------------------------------------------------------------------------
+# Pipeline runner — deterministic, no LLM routing between steps
+# ---------------------------------------------------------------------------
+
+def run_pipeline() -> None:
+    """Execute one full poll cycle: fetch -> reply -> slack -> notion."""
+    result = fetch_new_tickets()
+    tickets = result.get("tickets", [])
+
+    if not tickets:
+        logger.info("%s  No new tickets this cycle.", STEP_ICONS["skip"])
+        return
+
+    annotated = annotate_tickets_with_replies(tickets)
+    context   = {"tickets": annotated.get("tickets", [])}
+
+    post_slack_digest(context)
+    save_to_notion_kb(context)
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    """Run the support workflow loop, polling every POLL_INTERVAL seconds."""
+    _banner()
+    cycle = 0
+    while True:
+        cycle += 1
+        tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+        sep = f"{GREY}{'·' * 58}{RESET}" if tty else "·" * 58
+        print(sep)
+        logger.info("%s  Cycle #%d", STEP_ICONS["start"], cycle)
+        try:
+            run_pipeline()
+        except KeyboardInterrupt:
+            print()
+            logger.info("%s  Shutting down. Goodbye.", STEP_ICONS["done"])
+            break
+        except Exception as exc:
+            logger.error("%s  Cycle failed: %s", STEP_ICONS["error"], exc)
+        logger.info("%s  Next cycle in %ds...", STEP_ICONS["skip"], settings.POLL_INTERVAL)
+        try:
+            time.sleep(settings.POLL_INTERVAL)
+        except KeyboardInterrupt:
+            print()
+            logger.info("%s  Shutting down. Goodbye.", STEP_ICONS["done"])
+            break
+
 
 if __name__ == "__main__":
     main()
