@@ -1,0 +1,3 @@
+python-dotenv>=1.0.0
+google-adk>=2.3.0
+scalekit-sdk-python>=2.12.0
