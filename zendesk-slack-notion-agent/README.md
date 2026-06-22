@@ -162,6 +162,21 @@ Check these after the first poll cycle completes:
 
 ---
 
+## Troubleshooting
+
+| Error | Cause | Fix |
+|---|---|---|
+| `ValueError: Missing required env vars: ...` | One or more vars not set in `.env` | Copy `.env.example` to `.env` and fill all values |
+| `SupportProductInactive` from Zendesk | No active Zendesk Support plan | Activate a Zendesk Support trial; free trials include API access |
+| `429 RESOURCE_EXHAUSTED` from Gemini | Free tier quota hit (20 req/day on `gemini-2.5-flash`) | Enable billing on your Google Cloud project, or use a paid API key |
+| `400 Invalid property identifier` from Notion | Required columns missing from the database | Create Name (title), Ticket ID (number), Category (select), Reply (rich_text) columns in Notion |
+| Slack message not appearing | `PENDING_AUTH` on the Slack connected account | Re-authorize Slack for your identifier in the Scalekit dashboard |
+| `multiple connected accounts` error | Same identifier has 2+ connections for the same service | Set `SLACK_CONNECTION_NAME`, `ZENDESK_CONNECTION_NAME`, `NOTION_CONNECTION_NAME` in `.env` |
+| Same ticket re-posted after restart | Old code used in-memory dedup | Already fixed — `state/ticket_thread_map.json` persists across restarts |
+| Pipeline stops silently after step 1 or 2 | Old LLM orchestrator returned `MALFORMED_FUNCTION_CALL` | Already fixed — pipeline is deterministic Python, no LLM routing |
+
+---
+
 ## SDK versions
 
 - `scalekit-sdk-python >= 2.12.0`
