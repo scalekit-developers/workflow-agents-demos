@@ -4,7 +4,7 @@
 
 **Built with [Scalekit Agent Auth](https://scalekit.com).** All OAuth across Apollo, Gmail, and Google Sheets is managed by Scalekit. The agent never stores or refreshes tokens.
 
-**Reference:** [scalekit.com/agent-templates](https://www.scalekit.com/agent-templates)
+**Template:** [scalekit.com/agent-templates/outbound-prospecting-agent](https://www.scalekit.com/agent-templates/outbound-prospecting-agent)
 
 ---
 
