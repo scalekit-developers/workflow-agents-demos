@@ -1,6 +1,6 @@
 # Outbound Prospecting Agent (Apollo, Gmail, Google Sheets)
 
-> Search Apollo for ICP-matched prospects, draft personalized Gmail outreach, and log everything to Google Sheets — all without handling OAuth tokens directly.
+> Search Apollo for ICP-matched prospects, draft personalized Gmail outreach, and log everything to Google Sheets. No OAuth token handling in application code.
 
 **Built with [Scalekit Agent Auth](https://scalekit.com).** All OAuth across Apollo, Gmail, and Google Sheets is managed by Scalekit. The agent never stores or refreshes tokens.
 
@@ -92,14 +92,6 @@ python run_flow.py
 
 On the first run, any connector that is not yet authorized will print a magic link. Open it in a browser, complete OAuth, press Enter. Every run after that goes straight through.
 
-### 5. Run without Apollo (sample data mode)
-
-```bash
-USE_SAMPLE_DATA=true python run_flow.py
-```
-
-Skips Apollo entirely and uses five built-in sample prospects. Gmail drafts and Sheets logging still run against your real accounts. Good for testing the pipeline before setting up Apollo.
-
 ---
 
 ## What the output looks like
@@ -110,15 +102,14 @@ Skips Apollo entirely and uses five built-in sample prospects. Gmail drafts and 
   Apollo -> Gmail Drafts -> Google Sheets via Scalekit
 ────────────────────────────────────────────────────────────
   Environment  : https://your-env.scalekit.dev
-  Sample data  : False
   LLM drafting : OpenRouter (google/gemma-3-27b-it:free)
   Prospect cap : 5
 ────────────────────────────────────────────────────────────
 
 10:00:01 | INFO     | ⚙  Step 0: Connector auth
-10:00:02 | INFO     | ✔  apollo — ACTIVE
-10:00:02 | INFO     | ✔  gmail — ACTIVE
-10:00:03 | INFO     | ✔  googlesheets — ACTIVE
+10:00:02 | INFO     | ✔  apollo - ACTIVE
+10:00:02 | INFO     | ✔  gmail - ACTIVE
+10:00:03 | INFO     | ✔  googlesheets - ACTIVE
 10:00:03 | INFO     | ⌕  Step 1: Finding prospects
 10:00:05 | INFO     | ✔  Apollo returned 15 prospect(s)
 10:00:07 | INFO     | ✔  Top 5 prospects by ICP score
@@ -154,7 +145,7 @@ Skips Apollo entirely and uses five built-in sample prospects. Gmail drafts and 
 | Company size | 20 | Within `ICP_EMP_MIN` to `ICP_EMP_MAX` |
 | Buying signals | up to 25 | 5 pts per signal, capped at 25 |
 
-All ICP criteria are set in `.env` — no code changes needed to retarget.
+All ICP criteria are set in `.env`. No code changes needed to retarget.
 
 ---
 
@@ -182,7 +173,6 @@ All ICP criteria are set in `.env` — no code changes needed to retarget.
 | `ICP_EMP_MIN` | `50` | Minimum company headcount |
 | `ICP_EMP_MAX` | `5000` | Maximum company headcount |
 | `PROSPECT_LIMIT` | `5` | Max prospects to process per run |
-| `USE_SAMPLE_DATA` | `false` | Set to `true` to skip Apollo and use built-in sample prospects |
 | `OPENROUTER_API_KEY` | (none) | OpenRouter API key for LLM email drafting (falls back to template if not set) |
 | `OPENROUTER_MODEL` | `google/gemma-3-27b-it:free` | OpenRouter model to use |
 | `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
@@ -195,7 +185,7 @@ All ICP criteria are set in `.env` — no code changes needed to retarget.
 |---|---|---|
 | `ValueError: Missing required env vars` | One or more vars not set in `.env` | Copy `.env.example` to `.env` and fill all values |
 | Connector prints a magic link on startup | Account not yet authorized in Scalekit | Open the link in a browser, complete OAuth, press Enter |
-| `apollo — connector not found` | Apollo connector not added in Scalekit | Add an `apollo` connection in Scalekit dashboard, or set `USE_SAMPLE_DATA=true` |
+| `apollo connector not found` | Apollo connector not added in Scalekit | Add an `apollo` connection in Scalekit dashboard and set `APOLLO_CONNECTION_NAME` in `.env` |
 | Apollo returns 0 prospects | ICP filters too narrow | Broaden `ICP_TITLES`, `ICP_INDUSTRIES`, or `ICP_EMP_MIN`/`MAX` in `.env` |
 | `Gmail draft failed: 401` | Gmail OAuth token expired or revoked | Re-authorize the gmail connector in Scalekit dashboard |
 | `Sheets append failed` | Wrong `SHEETS_ID` or missing sheet permissions | Check the Sheet ID in the URL; make sure the Google account has edit access |
