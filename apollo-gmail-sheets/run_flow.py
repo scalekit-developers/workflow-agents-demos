@@ -1,317 +1,415 @@
 """
-Outbound Prospecting Agent: Apollo → Gmail → Google Sheets
+Outbound Prospecting Agent: Apollo -> Gmail -> Google Sheets
 
 Searches Apollo for ICP-matched prospects, drafts personalized Gmail outreach,
-and logs everything to a Google Sheets tracker — so SDRs spend time selling,
-not on admin.
+and logs everything to a Google Sheets tracker.
 
-Scalekit Agent Auth handles OAuth for all three connectors via execute_tool().
-No manual token management.
+Scalekit Agent Auth handles OAuth for Apollo, Gmail, and Google Sheets via
+execute_tool(). No token management needed in application code.
 
-LLM email drafting (OpenRouter) is used when OPENROUTER_API_KEY is set.
-Falls back to a template-based drafter automatically if not set.
-
-USE_SAMPLE_DATA=true  →  skip Apollo search, use bundled sample prospects.
-                          Useful for a first run without an Apollo connector.
+LLM email drafting uses OpenRouter when OPENROUTER_API_KEY is set.
+Falls back to a template that references real buying signals from Apollo.
 
 Setup:
-  cp .env.example .env        # fill in your credentials
+  cp .env.example .env        # fill in your credentials and connector names
   pip install -r requirements.txt
   python run_flow.py
 """
-import os, json, sys
-from dotenv import load_dotenv
-import scalekit.client
+import os
+import sys
+import json
+import logging
+import csv
+import pathlib
 
-load_dotenv()
+# Force gRPC to use the native DNS resolver — the default async resolver can
+# fail DNS lookups in some macOS / VPN / sandbox environments.
+os.environ.setdefault("GRPC_DNS_RESOLVER", "native")
 
-# ── Scalekit client ───────────────────────────────────────────────────────────
-sk = scalekit.client.ScalekitClient(
-    client_id=os.environ["SCALEKIT_CLIENT_ID"],
-    client_secret=os.environ["SCALEKIT_CLIENT_SECRET"],
-    env_url=os.environ["SCALEKIT_ENV_URL"],
+import settings
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+CYAN   = "\033[96m"
+WHITE  = "\033[97m"
+GREY   = "\033[90m"
+
+LEVEL_COLORS = {
+    "DEBUG":    GREY,
+    "INFO":     CYAN,
+    "WARNING":  YELLOW,
+    "ERROR":    RED,
+    "CRITICAL": RED + BOLD,
+}
+
+ICONS = {
+    "start":  "▶",
+    "done":   "✔",
+    "skip":   "–",
+    "warn":   "⚠",
+    "error":  "✖",
+    "auth":   "⚙",
+    "search": "⌕",
+    "draft":  "✉",
+    "sheet":  "▦",
+    "llm":    "✦",
+}
+
+
+class _NoiseFilter(logging.Filter):
+    _SKIP = ("AFC is enabled",)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not any(s in record.getMessage() for s in self._SKIP)
+
+
+class _ColorFormatter(logging.Formatter):
+    def __init__(self, colorize: bool = True):
+        super().__init__()
+        self.colorize = colorize
+
+    def format(self, record: logging.LogRecord) -> str:
+        ts    = self.formatTime(record, "%H:%M:%S")
+        level = record.levelname
+        msg   = record.getMessage()
+        if not self.colorize:
+            return f"{ts} | {level:<8} | {msg}"
+        col     = LEVEL_COLORS.get(level, WHITE)
+        ts_str  = f"{GREY}{ts}{RESET}"
+        lv_str  = f"{col}{BOLD}{level:<8}{RESET}"
+        msg_str = f"{WHITE}{msg}{RESET}" if level == "INFO" else f"{col}{msg}{RESET}"
+        return f"{ts_str} {DIM}|{RESET} {lv_str} {DIM}|{RESET} {msg_str}"
+
+
+def _setup_logging() -> None:
+    is_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(_ColorFormatter(colorize=is_tty))
+    handler.addFilter(_NoiseFilter())
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, settings.LOG_LEVEL, logging.INFO))
+    root.handlers = [handler]
+    for noisy in ("httpx", "httpcore", "grpc", "urllib3",
+                  "google.auth", "google.genai", "google.generativeai"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+_setup_logging()
+log = logging.getLogger("prospecting-agent")
+
+# ---------------------------------------------------------------------------
+# Startup validation
+# ---------------------------------------------------------------------------
+
+try:
+    settings.validate()
+except ValueError as exc:
+    tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+    msg = f"\n{RED}{BOLD}Configuration error:{RESET}\n  {exc}\n" if tty else f"\nConfiguration error:\n  {exc}\n"
+    print(msg)
+    sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# Scalekit client
+# ---------------------------------------------------------------------------
+
+from scalekit import ScalekitClient
+
+sk = ScalekitClient(
+    env_url=settings.SCALEKIT_ENV_URL,
+    client_id=settings.SCALEKIT_CLIENT_ID,
+    client_secret=settings.SCALEKIT_CLIENT_SECRET,
 )
-connect = sk.connect
 
-CONNECTOR_USERS = {
-    "apollo":       os.environ.get("APOLLO_USER", os.environ.get("GMAIL_USER", "")),
-    "gmail":        os.environ["GMAIL_USER"],
-    "googlesheets": os.environ["SHEETS_USER"],
-}
-SHEETS_ID       = os.environ["SHEETS_ID"]
-SHEETS_RANGE    = os.environ.get("SHEETS_RANGE", "Sheet1!A:H")
-USE_SAMPLE_DATA = os.environ.get("USE_SAMPLE_DATA", "false").lower() == "true"
-
-ICP = {
-    "titles":       os.environ.get("ICP_TITLES",    "VP of Sales,Head of Sales,Director of Sales,CRO").split(","),
-    "industries":   os.environ.get("ICP_INDUSTRIES", "SaaS,Software,Technology").split(","),
-    "employee_min": int(os.environ.get("ICP_EMP_MIN", "50")),
-    "employee_max": int(os.environ.get("ICP_EMP_MAX", "5000")),
-    "limit":        int(os.environ.get("PROSPECT_LIMIT", "5")),
+# Map each logical connector to (user identifier, exact connection name)
+CONNECTORS: dict[str, tuple[str, str]] = {
+    "apollo":       (settings.APOLLO_USER,  settings.APOLLO_CONNECTION_NAME),
+    "gmail":        (settings.GMAIL_USER,   settings.GMAIL_CONNECTION_NAME),
+    "googlesheets": (settings.SHEETS_USER,  settings.SHEETS_CONNECTION_NAME),
 }
 
-# ── Error tracking ─────────────────────────────────────────────────────────────
-_errors: list[str] = []
-
-def log_error(step: str, detail: str) -> None:
-    msg = f"[{step}] {detail}"
-    _errors.append(msg)
-    print(f"  ERROR {msg}")
-
-
-# ── Sample prospects (used when USE_SAMPLE_DATA=true) ─────────────────────────
-SAMPLE_PROSPECTS = [
-    {
-        "id": "sample_001",
-        "first_name": "Sarah", "last_name": "Chen",
-        "name": "Sarah Chen",
-        "title": "VP of Sales",
-        "email": "sarah.chen@novahq.io",
-        "organization": {
-            "name": "Nova HQ", "industry": "SaaS",
-            "estimated_num_employees": 320, "funding_stage": "Series B",
-            "short_description": "Nova HQ builds revenue intelligence tools for mid-market sales teams.",
-        },
-        "city": "San Francisco", "country": "United States",
-        "linkedin_url": "https://linkedin.com/in/sarahchen",
-        "buying_signals": ["Recent Series B ($28M)", "Hiring 4 AEs", "New VP Eng joined"],
-    },
-    {
-        "id": "sample_002",
-        "first_name": "Marcus", "last_name": "Webb",
-        "name": "Marcus Webb",
-        "title": "Head of Sales",
-        "email": "mwebb@loopdata.com",
-        "organization": {
-            "name": "Loop Data", "industry": "Analytics",
-            "estimated_num_employees": 180, "funding_stage": "Series A",
-            "short_description": "Loop Data automates data pipeline monitoring for data engineering teams.",
-        },
-        "city": "Austin", "country": "United States",
-        "linkedin_url": "https://linkedin.com/in/marcuswebb",
-        "buying_signals": ["Using Salesforce + Outreach", "Grew headcount 40% YoY"],
-    },
-    {
-        "id": "sample_003",
-        "first_name": "Priya", "last_name": "Nair",
-        "name": "Priya Nair",
-        "title": "Director of Sales",
-        "email": "pnair@stacklayer.dev",
-        "organization": {
-            "name": "StackLayer", "industry": "DevTools",
-            "estimated_num_employees": 95, "funding_stage": "Seed",
-            "short_description": "StackLayer simplifies cloud infrastructure provisioning for engineering teams.",
-        },
-        "city": "New York", "country": "United States",
-        "linkedin_url": "https://linkedin.com/in/priyanair",
-        "buying_signals": ["Just posted VP Sales role", "Product-led growth expanding to sales-led"],
-    },
-    {
-        "id": "sample_004",
-        "first_name": "James", "last_name": "Okafor",
-        "name": "James Okafor",
-        "title": "CRO",
-        "email": "james@gridlineai.com",
-        "organization": {
-            "name": "Gridline AI", "industry": "AI/ML SaaS",
-            "estimated_num_employees": 210, "funding_stage": "Series A",
-            "short_description": "Gridline AI provides automated model monitoring and observability for ML teams.",
-        },
-        "city": "London", "country": "United Kingdom",
-        "linkedin_url": "https://linkedin.com/in/jamesokafor",
-        "buying_signals": ["Raised $12M 3 months ago", "Hiring SDRs and AEs aggressively"],
-    },
-    {
-        "id": "sample_005",
-        "first_name": "Elena", "last_name": "Rossi",
-        "name": "Elena Rossi",
-        "title": "VP of Sales",
-        "email": "elena.rossi@forgecrm.io",
-        "organization": {
-            "name": "Forge CRM", "industry": "CRM Software",
-            "estimated_num_employees": 430, "funding_stage": "Series B",
-            "short_description": "Forge CRM is a vertical CRM built for construction and field service companies.",
-        },
-        "city": "Berlin", "country": "Germany",
-        "linkedin_url": "https://linkedin.com/in/elenarossi",
-        "buying_signals": ["Expanding into US market", "Recently replaced legacy outbound tooling"],
-    },
-]
-
-
-# ── Connector availability tracking ──────────────────────────────────────────
 _unavailable: set[str] = set()
+_run_errors:  list[str] = []
 
 
-# ── Auth helpers ──────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Banner
+# ---------------------------------------------------------------------------
+
+def _banner() -> None:
+    tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+    if not tty:
+        print("Outbound Prospecting Agent starting...")
+        return
+    line = f"{CYAN}{BOLD}{'─' * 60}{RESET}"
+    print(line)
+    print(f"{CYAN}{BOLD}  Outbound Prospecting Agent{RESET}")
+    print(f"{GREY}  Apollo → Gmail Drafts → Google Sheets via Scalekit{RESET}")
+    print(line)
+    print(f"  {GREY}Environment  :{RESET} {WHITE}{settings.SCALEKIT_ENV_URL}{RESET}")
+    print(f"  {GREY}Apollo       :{RESET} {WHITE}{settings.APOLLO_USER} / {settings.APOLLO_CONNECTION_NAME}{RESET}")
+    print(f"  {GREY}Gmail        :{RESET} {WHITE}{settings.GMAIL_USER} / {settings.GMAIL_CONNECTION_NAME}{RESET}")
+    print(f"  {GREY}Sheets       :{RESET} {WHITE}{settings.SHEETS_USER} / {settings.SHEETS_CONNECTION_NAME}{RESET}")
+    print(f"  {GREY}LLM drafting :{RESET} {WHITE}{'OpenRouter (' + settings.OPENROUTER_MODEL + ')' if settings.OPENROUTER_API_KEY else 'template fallback'}{RESET}")
+    print(f"  {GREY}Prospect cap :{RESET} {WHITE}{settings.PROSPECT_LIMIT}{RESET}")
+    print(line)
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+
 def ensure_authorized(connector: str) -> None:
-    """Check connector status. Prints a magic link if not yet authorized.
-
-    If the connector doesn't exist in Scalekit, marks it unavailable and
-    continues — the pipeline will fall back for that step.
-    """
+    """Check connector status. If not ACTIVE, print auth link and wait. Marks
+    unavailable on permanent failure so callers can decide whether to abort."""
     from scalekit.common.exceptions import ScalekitNotFoundException
-    identifier = CONNECTOR_USERS.get(connector, "")
+
+    identifier, connection_name = CONNECTORS[connector]
+    log.info("%s  Checking %s (user=%s, connector=%s)...",
+             ICONS["auth"], connector, identifier, connection_name)
     try:
-        resp = connect.get_or_create_connected_account(
-            connection_name=connector, identifier=identifier
+        resp   = sk.actions.get_or_create_connected_account(
+            connection_name=connection_name, identifier=identifier
         )
         status = resp.connected_account.status
-        if status != "ACTIVE":
-            link = connect.get_authorization_link(
-                connection_name=connector, identifier=identifier
-            ).link
-            print(f"\n  [{connector}] Status={status}. Open to authorize:\n    {link}\n")
-            input("  Press Enter after authorizing...")
-            # Re-check after auth
-            resp2 = connect.get_or_create_connected_account(
-                connection_name=connector, identifier=identifier
-            )
-            if resp2.connected_account.status == "ACTIVE":
-                print(f"  ✓ {connector} ({identifier}) — ACTIVE")
-            else:
-                log_error("auth", f"{connector} still not ACTIVE after auth (status={resp2.connected_account.status})")
-                _unavailable.add(connector)
+        if status == "ACTIVE":
+            log.info("%s  %s — ACTIVE", ICONS["done"], connector)
+            return
+
+        # Not active — print auth link and wait for user
+        link = sk.actions.get_authorization_link(
+            connection_name=connection_name, identifier=identifier
+        ).link
+        log.warning("%s  %s status=%s — open this link to authorize:\n    %s",
+                    ICONS["warn"], connector, status, link)
+        input(f"  Press Enter after completing OAuth for {connector}...")
+
+        resp2  = sk.actions.get_or_create_connected_account(
+            connection_name=connection_name, identifier=identifier
+        )
+        status2 = resp2.connected_account.status
+        if status2 == "ACTIVE":
+            log.info("%s  %s — ACTIVE", ICONS["done"], connector)
         else:
-            print(f"  ✓ {connector} ({identifier}) — ACTIVE")
+            log.error("%s  %s still not ACTIVE after auth (status=%s) — skipping this connector",
+                      ICONS["error"], connector, status2)
+            _unavailable.add(connector)
+
     except ScalekitNotFoundException:
-        print(f"  ✗ {connector} — connector not found in Scalekit dashboard (skipping, will use fallback)")
+        log.error(
+            "%s  %s — connector '%s' not found in Scalekit.\n"
+            "       Go to app.scalekit.com → Agent Auth → Connections and add it,\n"
+            "       then set %s_CONNECTION_NAME in .env to the exact connector name.",
+            ICONS["error"], connector, connection_name, connector.upper()
+        )
         _unavailable.add(connector)
-    except Exception as e:
-        log_error("auth", f"{connector} check failed: {e.__class__.__name__}: {e}")
+
+    except Exception as exc:
+        raw = str(exc)
+        short = next((l.strip() for l in raw.splitlines() if l.strip()), repr(exc))[:120]
+        log.error("%s  %s auth check failed: %s", ICONS["error"], connector, short)
         _unavailable.add(connector)
 
 
-def tool(connector: str, tool_name: str, **kwargs) -> dict:
-    """Execute a Scalekit tool and return the data payload.
-
-    Returns an empty dict if the connector is unavailable.
-    Raises on unexpected errors so callers can decide how to handle them.
-    """
+def execute_tool(connector: str, tool_name: str, **kwargs) -> dict:
+    """Call a Scalekit action tool. Raises RuntimeError on any failure — never swallows."""
     if connector in _unavailable:
-        return {}
+        raise RuntimeError(f"{connector} connector is unavailable (auth failed or not found)")
+    identifier, connection_name = CONNECTORS[connector]
+    log.debug("execute_tool  tool=%s  connector=%s  identifier=%s  input=%s",
+              tool_name, connection_name, identifier, kwargs)
     try:
-        result = connect.execute_tool(
+        result = sk.actions.execute_tool(
             tool_name=tool_name,
-            identifier=CONNECTOR_USERS[connector],
+            connection_name=connection_name,
+            identifier=identifier,
             tool_input=kwargs,
         )
         data = result.data or {}
-        print(f"  (execute_tool:{tool_name} ✓)")
+        log.debug("execute_tool  tool=%s  response_keys=%s", tool_name, list(data.keys()))
         return data
-    except Exception as e:
-        # Re-raise — callers decide whether to log, fallback, or abort
-        raise RuntimeError(f"execute_tool({tool_name}) failed: {e.__class__.__name__}: {e}") from e
+    except Exception as exc:
+        import traceback as _tb
+        log.debug("execute_tool exception for %s:\n%s", tool_name, _tb.format_exc())
+        raw = str(exc)
+        # Scalekit exceptions often start with newlines; strip and find the useful part
+        # Try gRPC details field first (most specific)
+        for marker in ('details = "', 'tool_error_message:', 'Error Code:'):
+            idx = raw.find(marker)
+            if idx != -1:
+                snippet = raw[idx:idx + 300].split("\n")[0].strip().strip('"')
+                if snippet:
+                    raise RuntimeError(f"{tool_name} failed: {snippet}") from exc
+        # Fall back to first non-empty line
+        first = next((l.strip() for l in raw.splitlines() if l.strip()), repr(exc)[:160])
+        raise RuntimeError(f"{tool_name} failed: {first[:160]}") from exc
 
 
-def _build_raw_mime(to: str, subject: str, body: str) -> str:
-    """Encode an email as base64url MIME — required by the Gmail API."""
-    import base64
-    from email.mime.text import MIMEText
-    from email.mime.multipart import MIMEMultipart
+# ---------------------------------------------------------------------------
+# ICP scoring
+# ---------------------------------------------------------------------------
 
-    msg = MIMEMultipart("alternative")
-    msg["to"]      = to
-    msg["subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-    return base64.urlsafe_b64encode(msg.as_bytes()).decode()
-
-
-def create_gmail_draft_via_scalekit(to: str, subject: str, body: str) -> dict:
-    """Create a Gmail draft via Scalekit token + Gmail REST API.
-
-    Scalekit owns the OAuth token via get_connected_account(), which auto-refreshes
-    it before expiry. We pass the token to the Gmail drafts endpoint directly.
-    Creates DRAFTS only — never sends.
-    """
-    import requests as http
-
-    raw = _build_raw_mime(to, subject, body)
-    identifier = CONNECTOR_USERS["gmail"]
-
-    try:
-        token_resp = connect.get_connected_account(
-            connection_name="gmail", identifier=identifier
-        )
-        token = token_resp.connected_account.authorization_details["oauth_token"]["access_token"]
-        resp = http.post(
-            "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"message": {"raw": raw}},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        print("  (Scalekit token + Gmail REST ✓)")
-        return resp.json()
-    except Exception as e:
-        raise RuntimeError(f"Gmail draft failed: {e.__class__.__name__}: {e}") from e
-
-
-# ── ICP scoring ───────────────────────────────────────────────────────────────
-def score_prospect(prospect: dict) -> int:
-    """Score a prospect 0–100 against ICP criteria.
-
-    Points breakdown:
-      Title match       30 pts
-      Industry match    25 pts
-      Company size      20 pts
-      Buying signals    25 pts (5 pts per signal, max 25)
-    """
+def _score(prospect: dict) -> int:
     score = 0
     title = (prospect.get("title") or "").lower()
     org   = prospect.get("organization") or {}
 
-    if any(t.lower() in title for t in ICP["titles"]):
+    if any(t.lower() in title for t in settings.ICP_TITLES):
         score += 30
 
     industry = (org.get("industry") or "").lower()
-    if any(i.lower() in industry for i in ICP["industries"]):
+    if any(i.lower() in industry for i in settings.ICP_INDUSTRIES):
         score += 25
 
-    emp = org.get("estimated_num_employees") or 0
-    if ICP["employee_min"] <= emp <= ICP["employee_max"]:
+    emp = int(org.get("estimated_num_employees") or 0)
+    if settings.ICP_EMP_MIN <= emp <= settings.ICP_EMP_MAX:
         score += 20
 
-    signals = prospect.get("buying_signals") or []
-    score += min(len(signals) * 5, 25)
-
+    score += min(len(prospect.get("buying_signals") or []) * 5, 25)
     return score
 
 
-# ── Email drafting ─────────────────────────────────────────────────────────────
-def _draft_with_llm(prospect: dict) -> tuple[str, str]:
-    """Use OpenRouter to draft a personalized outreach email."""
-    import requests as http
+# ---------------------------------------------------------------------------
+# Apollo: search + enrich
+# ---------------------------------------------------------------------------
 
+def fetch_prospects() -> list[dict]:
+    """Call Apollo search, enrich each result, extract buying signals, score."""
+    title_str    = ",".join(settings.ICP_TITLES)
+    industry_str = ",".join(settings.ICP_INDUSTRIES)
+    per_page     = min(settings.PROSPECT_LIMIT * 3, 100)
+
+    log.info("%s  Calling apollo_search_contacts (titles=%s, industries=%s, per_page=%d)",
+             ICONS["search"], settings.ICP_TITLES, settings.ICP_INDUSTRIES, per_page)
+    try:
+        # Apollo's backend expects arrays for title and industry even though
+        # the tool schema declares them as strings.
+        data = execute_tool(
+            "apollo", "apollo_search_contacts",
+            title=settings.ICP_TITLES,
+            industry=settings.ICP_INDUSTRIES,
+            per_page=per_page,
+        )
+    except RuntimeError as exc:
+        log.error("%s  Apollo search failed: %s", ICONS["error"], exc)
+        raise
+
+    raw = data.get("contacts") or data.get("people") or data.get("results") or []
+    log.info("%s  Apollo returned %d raw prospect(s) (response keys: %s)",
+             ICONS["done"], len(raw), list(data.keys()))
+
+    if not raw:
+        log.warning(
+            "%s  Apollo search returned 0 contacts (total_entries=%s).\n"
+            "       Possible causes:\n"
+            "         1. Apollo free tier has limited prospecting credits — check apollo.io → Credits\n"
+            "         2. ICP filters are too narrow — try broadening ICP_TITLES or ICP_INDUSTRIES in .env\n"
+            "         3. Apollo connector needs the 'Sequences & Email' plan for people search",
+            ICONS["warn"],
+            data.get("pagination", {}).get("total_entries", "?")
+        )
+
+    prospects = []
+    for p in raw:
+        person_id = p.get("person_id") or p.get("id") or ""
+
+        # Enrich if missing key fields
+        if person_id and not (p.get("email") and p.get("title") and p.get("name")):
+            log.debug("Enriching prospect id=%s name=%s", person_id, p.get("name", "?"))
+            try:
+                enriched = execute_tool("apollo", "apollo_enrich_contact", id=person_id)
+                obj = enriched.get("person") or enriched.get("contact") or {}
+                for k, v in obj.items():
+                    if v and not p.get(k):
+                        p[k] = v
+                log.debug("Enriched %s — got email=%s title=%s",
+                          p.get("name", person_id), bool(p.get("email")), bool(p.get("title")))
+            except RuntimeError as exc:
+                log.warning("%s  Enrich failed for %s: %s",
+                            ICONS["warn"], p.get("name", person_id), exc)
+
+        # Normalise org field — Apollo sometimes uses account or organization_name
+        if not p.get("organization"):
+            if p.get("organization_name"):
+                p["organization"] = {"name": p["organization_name"]}
+            elif p.get("account"):
+                p["organization"] = p["account"]
+
+        org = p.get("organization") or {}
+        if p.get("account"):
+            acc = p["account"]
+            if not org.get("estimated_num_employees"):
+                org["estimated_num_employees"] = acc.get("estimated_num_employees") or 0
+            if not org.get("industry"):
+                org["industry"] = acc.get("industry") or ""
+            if not org.get("name"):
+                org["name"] = acc.get("name") or ""
+            p["organization"] = org
+
+        # Extract buying signals from Apollo fields
+        signals = list(p.get("buying_signals") or [])
+        fs = org.get("funding_stage")
+        if fs and f"Funding stage: {fs}" not in signals:
+            signals.insert(0, f"Funding stage: {fs}")
+        keywords = p.get("keywords") or []
+        for kw in keywords[:3]:
+            if kw not in signals:
+                signals.append(kw)
+        p["buying_signals"] = signals
+
+        p["icp_score"] = _score(p)
+        log.debug("Prospect %s | title=%s | org=%s | score=%d",
+                  p.get("name"), p.get("title"), org.get("name"), p["icp_score"])
+        prospects.append(p)
+
+    prospects.sort(key=lambda x: x["icp_score"], reverse=True)
+    top = prospects[:settings.PROSPECT_LIMIT]
+
+    log.info("%s  Top %d/%d prospects after ICP scoring:",
+             ICONS["done"], len(top), len(prospects))
+    for p in top:
+        log.info("     %-30s %-25s score=%d",
+                 p.get("name", "?"), p.get("title", "")[:25], p["icp_score"])
+
+    return top
+
+
+# ---------------------------------------------------------------------------
+# Email drafting
+# ---------------------------------------------------------------------------
+
+def _draft_llm(prospect: dict) -> tuple[str, str]:
+    import requests as http
     org     = prospect.get("organization") or {}
     signals = "\n".join(f"- {s}" for s in (prospect.get("buying_signals") or []))
-
-    prompt = f"""Write a short, personalized cold outreach email for a sales rep to send.
-
-Prospect:
-- Name: {prospect['name']}
-- Title: {prospect.get('title', '')}
-- Company: {org.get('name', '')}
-- Industry: {org.get('industry', '')}
-- Company description: {org.get('short_description', '')}
-- Buying signals:
-{signals}
-
-Rules:
-- Subject line: compelling, under 60 characters, no spam words
-- Body: 3-4 short paragraphs max
-- Reference ONE specific buying signal — make it feel researched, not templated
-- End with a single low-friction CTA (15-min call, not a demo request)
-- No generic openers ("Hope this finds you well")
-- Tone: peer-to-peer, not vendor-to-prospect
-
-Return ONLY valid JSON with keys: subject (string), body (string, use \\n for newlines)"""
-
+    prompt  = (
+        f"Write a short cold outreach email.\n\n"
+        f"Prospect: {prospect.get('name','')}, {prospect.get('title','')} at {org.get('name','')}\n"
+        f"Industry: {org.get('industry','')}\n"
+        f"About company: {org.get('short_description') or org.get('name','')}\n"
+        f"Buying signals:\n{signals or '(none available)'}\n\n"
+        f"Rules:\n"
+        f"- Subject line under 60 chars, no spam words\n"
+        f"- 3-4 short paragraphs, peer-to-peer tone\n"
+        f"- Reference ONE specific buying signal\n"
+        f"- CTA: 15-min call, not a demo\n"
+        f"- No generic openers like 'I hope this email finds you'\n\n"
+        f"Return ONLY valid JSON with two keys: {{\"subject\": \"...\", \"body\": \"...\"}}"
+    )
+    log.debug("Calling OpenRouter model=%s", settings.OPENROUTER_MODEL)
     resp = http.post(
         "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"},
+        headers={"Authorization": f"Bearer {settings.OPENROUTER_API_KEY}"},
         json={
-            "model": os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free"),
+            "model": settings.OPENROUTER_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.7,
         },
@@ -319,281 +417,272 @@ Return ONLY valid JSON with keys: subject (string), body (string, use \\n for ne
     )
     resp.raise_for_status()
     raw = resp.json()["choices"][0]["message"]["content"].strip()
+    log.debug("LLM raw response (first 200): %s", raw[:200])
+
+    # Strip markdown fences if the model wrapped it
     if "```" in raw:
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
     start, end = raw.find("{"), raw.rfind("}") + 1
+    if start == -1 or end == 0:
+        raise ValueError(f"LLM response did not contain JSON: {raw[:200]}")
     parsed = json.loads(raw[start:end])
+    if "subject" not in parsed or "body" not in parsed:
+        raise ValueError(f"LLM JSON missing subject/body keys: {parsed}")
     return parsed["subject"], parsed["body"]
 
 
 def _draft_template(prospect: dict) -> tuple[str, str]:
-    """Template-based fallback — no LLM needed."""
     org     = prospect.get("organization") or {}
-    name    = prospect.get("first_name") or prospect.get("name", "there")
-    company = org.get("name", "your company")
+    name    = prospect.get("first_name") or (prospect.get("name") or "there").split()[0]
+    company = org.get("name") or "your company"
+    title   = prospect.get("title") or "sales leader"
     signals = prospect.get("buying_signals") or []
     signal  = signals[0] if signals else f"the growth at {company}"
-    title   = prospect.get("title", "")
-
-    subject = f"Quick question for {company}'s sales team"
-    body = (
-        f"Hi {name},\n\n"
-        f"Noticed {signal} — congrats on the momentum.\n\n"
-        f"We work with {title.lower()}s at similar-stage companies to cut the time reps spend on "
-        f"admin (research, CRM updates, follow-up drafting) by around 70%. "
-        f"The idea is to give back selling time, not add another tool to the stack.\n\n"
-        f"Worth a 15-minute call to see if it's relevant for {company}?\n\n"
-        f"Best"
-    )
+    # Use plain ASCII apostrophe and hyphen — Scalekit's template engine chokes
+    # on Unicode dashes (em-dash U+2014) inside tool_input strings.
+    subject = f"Quick question for {company}"
+    body = "\n\n".join([
+        f"Hi {name},",
+        f"Noticed {signal} - congrats on the momentum.",
+        (
+            f"We work with {title.lower()}s at similar-stage companies to cut the time reps spend"
+            f" on admin (research, CRM updates, follow-up drafting) by around 70%."
+            f" The idea is to give back selling time, not add another tool to the stack."
+        ),
+        f"Worth a 15-minute call to see if it is relevant for {company}?",
+        "Best",
+    ])
     return subject, body
 
 
 def draft_email(prospect: dict) -> tuple[str, str]:
-    """LLM draft if OPENROUTER_API_KEY is set; template fallback otherwise."""
-    if os.environ.get("OPENROUTER_API_KEY"):
+    if settings.OPENROUTER_API_KEY:
         try:
-            subject, body = _draft_with_llm(prospect)
-            print("  (LLM draft ✓)")
+            subject, body = _draft_llm(prospect)
+            log.info("%s  LLM draft OK for %s", ICONS["llm"], prospect.get("name"))
             return subject, body
-        except Exception as e:
-            print(f"  ⚠ LLM failed ({e.__class__.__name__}: {e}) — using template fallback")
-    return _draft_template(prospect)
+        except Exception as exc:
+            short = str(exc).split("\n")[0][:120]
+            log.warning("%s  LLM failed for %s (%s) — using template fallback",
+                        ICONS["warn"], prospect.get("name"), short)
+    subject, body = _draft_template(prospect)
+    log.debug("Template draft for %s: subject=%s", prospect.get("name"), subject)
+    return subject, body
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 0 — Check connector auth
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n── Step 0: Checking connector auth ──")
-connectors_to_check = ["gmail", "googlesheets"]
-if not USE_SAMPLE_DATA:
-    connectors_to_check.insert(0, "apollo")
-for connector in connectors_to_check:
-    ensure_authorized(connector)
+# ---------------------------------------------------------------------------
+# Gmail
+# ---------------------------------------------------------------------------
 
-if USE_SAMPLE_DATA:
-    print("  ℹ  USE_SAMPLE_DATA=true — skipping Apollo auth, using bundled prospects")
-
-# Hard-stop if Gmail is unavailable — we can't draft anything without it
-if "gmail" in _unavailable:
-    log_error("auth", "Gmail connector unavailable — cannot draft emails. "
-              "Set up the 'gmail' connection in Scalekit dashboard and re-run.")
-    print("\n✗ Fatal: Gmail unavailable. See errors above.")
-    sys.exit(1)
+def create_gmail_draft(to: str, subject: str, body: str) -> dict:
+    log.debug("Creating Gmail draft to=%s subject=%s", to, subject)
+    data = execute_tool(
+        "gmail", "gmail_create_draft",
+        to=to,
+        subject=subject,
+        body=body,
+        content_type="text/plain",
+    )
+    log.debug("Gmail draft created: %s", data)
+    return data
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — Find prospects (Apollo or sample data)
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n── Step 1: Finding prospects ──")
+# ---------------------------------------------------------------------------
+# Google Sheets
+# ---------------------------------------------------------------------------
 
-if USE_SAMPLE_DATA:
-    prospects = SAMPLE_PROSPECTS
-    print(f"  Using {len(prospects)} sample prospects (set USE_SAMPLE_DATA=false to use Apollo)")
-else:
-    if "apollo" in _unavailable:
-        log_error("step1", "Apollo connector unavailable — cannot search. "
-                  "Set USE_SAMPLE_DATA=true or set up the apollo connector.")
-        print("\n✗ Fatal: Apollo unavailable and USE_SAMPLE_DATA=false.")
+SHEETS_HEADERS = ["Name", "Company", "Title", "Email", "ICP Score",
+                  "Buying Signals", "Email Subject", "Draft Link"]
+
+
+def _sheets_get_values(sheet_id: str, range_: str) -> list:
+    data = execute_tool(
+        "googlesheets", "googlesheets_get_values",
+        spreadsheet_id=sheet_id,
+        range=range_,
+    )
+    return data.get("values") or []
+
+
+def _sheets_append(sheet_id: str, rows: list) -> None:
+    data = execute_tool(
+        "googlesheets", "googlesheets_append_values",
+        spreadsheet_id=sheet_id,
+        range=settings.SHEETS_RANGE,
+        values=rows,
+        value_input_option="RAW",
+        insert_data_option="INSERT_ROWS",
+    )
+    log.debug("Sheets appended rows, response keys: %s", list(data.keys()))
+
+
+# ===========================================================================
+# MAIN PIPELINE
+# ===========================================================================
+
+def main() -> None:
+    _banner()
+
+    # -----------------------------------------------------------------------
+    # Step 0: Auth — all three connectors must be checked
+    # -----------------------------------------------------------------------
+    log.info("%s  Step 0: Connector auth", ICONS["start"])
+    for connector in ["apollo", "gmail", "googlesheets"]:
+        ensure_authorized(connector)
+
+    # Gmail and Apollo are hard requirements
+    missing_critical = [c for c in ("apollo", "gmail") if c in _unavailable]
+    if missing_critical:
+        for c in missing_critical:
+            log.error(
+                "%s  %s is unavailable — cannot continue.\n"
+                "       Add connector '%s' in Scalekit → Agent Auth → Connections,\n"
+                "       authorize it, then set %s_CONNECTION_NAME in .env.",
+                ICONS["error"], c, CONNECTORS[c][1], c.upper()
+            )
         sys.exit(1)
 
-    try:
-        search_data = tool(
-            "apollo", "apollo_search_contacts",
-            titles=ICP["titles"],
-            industries=ICP["industries"],
-            employee_ranges=[f"{ICP['employee_min']},{ICP['employee_max']}"],
-            limit=ICP["limit"] * 3,
-        )
-        raw_prospects = (
-            search_data.get("contacts")
-            or search_data.get("results")
-            or search_data.get("people")
-            or []
-        )
-        print(f"  Apollo returned {len(raw_prospects)} prospect(s)")
-        if not raw_prospects:
-            log_error("step1", "Apollo search returned 0 prospects — check ICP filter settings")
-    except RuntimeError as e:
-        log_error("step1", f"Apollo search failed: {e}")
-        raw_prospects = []
+    sheets_connector_ok = "googlesheets" not in _unavailable
+    sheets_id = settings.SHEETS_ID if (settings.SHEETS_ID and settings.SHEETS_ID != "your_sheet_id_here") else ""
 
-    # Enrich each prospect — use person_id (not id) for the enrich call.
-    # Only fill in fields that are missing from the search result; never
-    # overwrite a non-empty field with an empty one from the enriched record.
-    prospects = []
-    for p in raw_prospects:
-        # apollo_search_contacts returns both 'id' (CRM contact id) and
-        # 'person_id' (prospecting person id). Enrich needs person_id.
-        person_id = p.get("person_id") or p.get("id") or ""
-        if person_id and not (p.get("email") and p.get("title") and p.get("name")):
-            try:
-                enriched = tool("apollo", "apollo_enrich_contact", id=person_id)
-                enriched_obj = enriched.get("person") or enriched.get("contact") or {}
-                # Safe merge: only fill in keys that are absent/empty in p
-                for k, v in enriched_obj.items():
-                    if v and not p.get(k):
-                        p[k] = v
-            except RuntimeError as e:
-                log_error("step1", f"Enrich failed for {p.get('name', person_id)}: {e}")
-
-        # Map organisation_name → organisation.name for scoring if needed
-        if not p.get("organization") and p.get("organization_name"):
-            p["organization"] = {"name": p["organization_name"]}
-        # Pull employee count from account object if org is missing it
-        if p.get("account") and p.get("organization") is not None:
-            acc = p["account"]
-            if not p["organization"].get("estimated_num_employees"):
-                p["organization"]["estimated_num_employees"] = acc.get("estimated_num_employees") or 0
-            if not p["organization"].get("industry"):
-                p["organization"]["industry"] = acc.get("industry") or ""
-
-        p.setdefault("buying_signals", [])
-        if p.get("organization", {}).get("funding_stage"):
-            p["buying_signals"].insert(0, f"Funding stage: {p['organization']['funding_stage']}")
-
-        p["icp_score"] = score_prospect(p)
-        prospects.append(p)
-
-    prospects.sort(key=lambda x: x.get("icp_score", 0), reverse=True)
-    prospects = prospects[:ICP["limit"]]
-    print(f"  Filtered to top {len(prospects)} by ICP score")
-
-# Score sample prospects
-for p in prospects:
-    if "icp_score" not in p:
-        p["icp_score"] = score_prospect(p)
-prospects.sort(key=lambda x: x.get("icp_score", 0), reverse=True)
-
-if not prospects:
-    log_error("step1", "No prospects to process — exiting")
-    print("\n✗ Fatal: No prospects found.")
-    sys.exit(1)
-
-print(f"  Prospects ({len(prospects)}): {[p['name'] for p in prospects]}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — Draft personalized Gmail emails
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n── Step 2: Drafting Gmail emails ──")
-drafted = []
-draft_errors = 0
-
-for p in prospects:
-    org   = p.get("organization") or {}
-    email = p.get("email") or ""
-    print(f"\n  [{p['name']} | {p.get('title','')} @ {org.get('name','')}]")
-    print(f"  ICP score: {p.get('icp_score', 0)}/100")
-    print(f"  Signals:   {', '.join(p.get('buying_signals') or []) or 'none'}")
-
-    if not email:
-        log_error("step2", f"No email for {p['name']} — skipping draft")
-        continue
-
-    subject, body = draft_email(p)
-
-    try:
-        draft_resp = create_gmail_draft_via_scalekit(to=email, subject=subject, body=body)
-        draft_id   = draft_resp.get("id", "draft_created")
-        draft_link = f"https://mail.google.com/mail/#drafts/{draft_id}"
-        print(f"  Draft → {email}")
-        print(f"  Subject: {subject}")
-        print(f"  Link:    {draft_link}")
-    except Exception as e:
-        draft_id   = "error"
-        draft_link = f"error"
-        draft_errors += 1
-        log_error("step2", f"Gmail draft failed for {p['name']} ({email}): {e}")
-
-    drafted.append({
-        **p,
-        "email_subject": subject,
-        "email_body":    body,
-        "draft_id":      draft_id,
-        "draft_link":    draft_link,
-    })
-
-print(f"\n  Drafted: {len(drafted) - draft_errors}/{len(prospects)} "
-      f"({'all ok' if draft_errors == 0 else f'{draft_errors} error(s)'})")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — Log to Google Sheets (fallback: local CSV)
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n── Step 3: Logging prospects ──")
-
-HEADERS = ["Name", "Company", "Title", "Email", "ICP Score",
-           "Buying Signals", "Email Subject", "Draft Link"]
-
-sheets_ok = "googlesheets" not in _unavailable and SHEETS_ID != "your_sheet_id_here"
-
-if sheets_ok:
-    import requests as http
-
-    def _sheets_token() -> str:
-        resp = connect.get_connected_account(
-            connection_name="googlesheets",
-            identifier=CONNECTOR_USERS["googlesheets"],
-        )
-        return resp.connected_account.authorization_details["oauth_token"]["access_token"]
-
-    def _sheets_get(range_: str) -> dict:
-        """Read a range — Tier 1: execute_tool, Tier 2: Sheets REST API."""
+    # Auto-create a sheet via Scalekit if the connector is active but no SHEETS_ID is set
+    if sheets_connector_ok and not sheets_id:
+        log.info("%s  SHEETS_ID not set — creating a new Google Sheet via Scalekit...", ICONS["sheet"])
         try:
-            data = tool("googlesheets", "googlesheets_get_values",
-                        spreadsheet_id=SHEETS_ID, range=range_)
-            return data
-        except Exception as e1:
-            print(f"  (googlesheets_get_values unavailable: {e1.__class__.__name__} — trying REST)")
-        token = _sheets_token()
-        resp = http.get(
-            f"https://sheets.googleapis.com/v4/spreadsheets/{SHEETS_ID}/values/{range_}",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        print("  (Scalekit token + Sheets REST GET ✓)")
-        return resp.json()
+            data = execute_tool(
+                "googlesheets", "googlesheets_create_spreadsheet",
+                title="Prospecting Agent - Outreach Tracker",
+            )
+            sheets_id = data.get("spreadsheetId", "")
+            sheet_url = data.get("spreadsheetUrl", "")
+            if sheets_id:
+                log.info("%s  Sheet created: %s", ICONS["done"], sheet_url)
+                log.info("     Add this to .env to reuse on next run: SHEETS_ID=%s", sheets_id)
+            else:
+                log.warning("%s  Sheet creation returned no ID — falling back to CSV", ICONS["warn"])
+        except RuntimeError as exc:
+            log.warning("%s  Could not create sheet: %s — falling back to CSV", ICONS["warn"], exc)
 
-    def _sheets_append(values: list) -> None:
-        """Append rows — Tier 1: execute_tool, Tier 2: Sheets REST API."""
-        try:
-            tool("googlesheets", "googlesheets_append_values",
-                 spreadsheet_id=SHEETS_ID, range=SHEETS_RANGE, values=values)
-            return
-        except Exception as e1:
-            print(f"  (googlesheets_append_values unavailable: {e1.__class__.__name__} — trying REST)")
-        token = _sheets_token()
-        resp = http.post(
-            f"https://sheets.googleapis.com/v4/spreadsheets/{SHEETS_ID}"
-            f"/values/{SHEETS_RANGE}:append"
-            f"?valueInputOption=RAW&insertDataOption=INSERT_ROWS",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"values": values},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        print("  (Scalekit token + Sheets REST APPEND ✓)")
+    sheets_available = sheets_connector_ok and bool(sheets_id)
 
-    # Write header row if sheet is empty
-    try:
-        header_check = _sheets_get(f"{SHEETS_RANGE.split('!')[0]}!A1:H1")
-        if not (header_check.get("values") or []):
-            _sheets_append([HEADERS])
-            print("  Header row written ✓")
+    if not sheets_available:
+        if not sheets_connector_ok:
+            log.warning(
+                "%s  Google Sheets connector unavailable — results will be saved to CSV.\n"
+                "       Add 'googlesheets' connector in Scalekit → Agent Auth → Connections.",
+                ICONS["warn"]
+            )
         else:
-            print("  Header row already exists ✓")
-    except Exception as e:
-        log_error("step3", f"Header check failed: {e.__class__.__name__}: {e} — continuing without header")
+            log.warning("%s  Could not resolve a Sheet ID — results will be saved to CSV.", ICONS["warn"])
 
-    sheets_logged = 0
-    for p in drafted:
-        org     = p.get("organization") or {}
-        signals = "; ".join(p.get("buying_signals") or [])
+    # -----------------------------------------------------------------------
+    # Step 1: Apollo — search and enrich
+    # -----------------------------------------------------------------------
+    log.info("%s  Step 1: Fetching prospects from Apollo", ICONS["search"])
+    try:
+        prospects = fetch_prospects()
+    except RuntimeError as exc:
+        log.error("%s  Could not fetch prospects: %s", ICONS["error"], exc)
+        sys.exit(1)
+
+    if not prospects:
+        log.error(
+            "%s  No prospects returned from Apollo after scoring.\n"
+            "       Broaden ICP_TITLES, ICP_INDUSTRIES, or ICP_EMP range in .env.",
+            ICONS["error"]
+        )
+        sys.exit(1)
+
+    # -----------------------------------------------------------------------
+    # Step 2: Draft emails and create Gmail drafts
+    # -----------------------------------------------------------------------
+    log.info("%s  Step 2: Drafting emails and creating Gmail drafts (%d prospects)",
+             ICONS["draft"], len(prospects))
+    drafted      = []   # all attempted (success + failed drafts)
+    draft_ok     = 0   # successfully created Gmail drafts
+    draft_errors = 0   # failed Gmail draft creations
+    skipped      = 0   # no email address
+
+    for p in prospects:
+        org   = p.get("organization") or {}
+        email = p.get("email") or ""
+        name  = p.get("name") or "Unknown"
+
+        log.info("     %s | %s @ %s | ICP score=%d",
+                 name, p.get("title", ""), org.get("name", ""), p.get("icp_score", 0))
+        if p.get("buying_signals"):
+            log.info("     Signals: %s", ", ".join(p["buying_signals"]))
+
+        if not email:
+            msg = f"No email address for {name} — skipping draft"
+            log.warning("%s  %s", ICONS["warn"], msg)
+            _run_errors.append(msg)
+            skipped += 1
+            continue
+
+        subject, body = draft_email(p)
+
+        draft_id  = ""
+        draft_url = ""
         try:
-            _sheets_append([[
+            resp      = create_gmail_draft(to=email, subject=subject, body=body)
+            draft_id  = resp.get("id", "")
+            draft_url = f"https://mail.google.com/mail/#drafts/{draft_id}" if draft_id else "created"
+            draft_ok += 1
+            log.info("%s  Draft created → %s", ICONS["done"], email)
+            log.info("     Subject: %s", subject)
+            log.info("     Link   : %s", draft_url)
+        except RuntimeError as exc:
+            draft_id  = "error"
+            draft_url = "error"
+            draft_errors += 1
+            log.error("%s  Gmail draft failed for %s: %s", ICONS["error"], name, exc)
+            _run_errors.append(f"Gmail draft failed for {name}: {exc}")
+
+        drafted.append({
+            **p,
+            "email_subject": subject,
+            "email_body":    body,
+            "draft_id":      draft_id,
+            "draft_link":    draft_url,
+        })
+
+    attempted = len(prospects) - skipped
+    if skipped:
+        log.warning("%s  %d prospect(s) had no email — skipped", ICONS["warn"], skipped)
+    if draft_errors:
+        log.warning("%s  Drafted %d/%d (%d failed)",
+                    ICONS["warn"], draft_ok, attempted, draft_errors)
+    else:
+        log.info("%s  Drafted %d/%d", ICONS["done"], draft_ok, attempted)
+
+    # -----------------------------------------------------------------------
+    # Step 3: Log to Google Sheets (CSV fallback)
+    # -----------------------------------------------------------------------
+    log.info("%s  Step 3: Logging results", ICONS["sheet"])
+    logged = 0
+
+    if sheets_available:
+        # Write header row if the sheet is empty
+        try:
+            existing = _sheets_get_values(
+                sheets_id, f"{settings.SHEETS_RANGE.split('!')[0]}!A1:H1"
+            )
+            if not existing:
+                _sheets_append(sheets_id, [SHEETS_HEADERS])
+                log.info("%s  Header row written to sheet", ICONS["done"])
+        except RuntimeError as exc:
+            log.warning("%s  Could not check/write sheet header: %s", ICONS["warn"], exc)
+
+        for p in drafted:
+            if p.get("draft_id") == "error":
+                log.debug("Skipping Sheets row for %s — draft failed", p.get("name"))
+                continue
+            org     = p.get("organization") or {}
+            signals = "; ".join(p.get("buying_signals") or [])
+            row     = [
                 p.get("name", ""),
                 org.get("name", ""),
                 p.get("title", ""),
@@ -602,74 +691,66 @@ if sheets_ok:
                 signals,
                 p.get("email_subject", ""),
                 p.get("draft_link", ""),
-            ]])
-            sheets_logged += 1
-            print(f"  ✓ {p['name']} @ {org.get('name', '')} → Sheets")
-        except Exception as e:
-            log_error("step3", f"Sheets append failed for {p['name']}: {e.__class__.__name__}: {e}")
+            ]
+            try:
+                _sheets_append(sheets_id, [row])
+                logged += 1
+                log.info("%s  %s @ %s → Sheets", ICONS["done"], p.get("name"), org.get("name", ""))
+            except RuntimeError as exc:
+                log.error("%s  Sheets append failed for %s: %s",
+                          ICONS["error"], p.get("name"), exc)
+                _run_errors.append(f"Sheets failed for {p.get('name')}: {exc}")
 
-    print(f"\n  Logged {sheets_logged}/{len(drafted)} rows to Google Sheets")
-    print(f"  Sheet: https://docs.google.com/spreadsheets/d/{SHEETS_ID}")
+        log.info("%s  Logged %d/%d rows to Sheets", ICONS["done"], logged, len(drafted))
+        log.info("     https://docs.google.com/spreadsheets/d/%s", sheets_id)
 
-else:
-    # Fallback: local CSV
-    import csv, pathlib
-    csv_path = pathlib.Path(__file__).parent / "prospects_output.csv"
-    write_header = not csv_path.exists()
-    try:
-        with open(csv_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            if write_header:
-                writer.writerow(HEADERS)
-            for p in drafted:
-                org     = p.get("organization") or {}
-                signals = "; ".join(p.get("buying_signals") or [])
-                writer.writerow([
-                    p.get("name", ""),
-                    org.get("name", ""),
-                    p.get("title", ""),
-                    p.get("email", ""),
-                    p.get("icp_score", 0),
-                    signals,
-                    p.get("email_subject", ""),
-                    p.get("draft_link", ""),
-                ])
-                print(f"  ✓ {p['name']} → {csv_path.name}")
-        print(f"\n  Saved to: {csv_path}")
-    except Exception as e:
-        log_error("step3", f"CSV write failed: {e}")
-
-    if "googlesheets" in _unavailable:
-        print("  ℹ  Set up a 'googlesheets' connector in Scalekit to write to a real sheet")
     else:
-        print("  ℹ  Set SHEETS_ID in .env to write to a real Google Sheet")
+        csv_path   = pathlib.Path(__file__).parent / "prospects_output.csv"
+        write_hdr  = not csv_path.exists()
+        try:
+            with open(csv_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                if write_hdr:
+                    writer.writerow(SHEETS_HEADERS)
+                for p in drafted:
+                    org     = p.get("organization") or {}
+                    signals = "; ".join(p.get("buying_signals") or [])
+                    writer.writerow([
+                        p.get("name", ""), org.get("name", ""), p.get("title", ""),
+                        p.get("email", ""), p.get("icp_score", 0), signals,
+                        p.get("email_subject", ""), p.get("draft_link", ""),
+                    ])
+                    logged += 1
+            log.info("%s  Saved %d row(s) to %s", ICONS["done"], logged, csv_path)
+        except OSError as exc:
+            log.error("%s  CSV write failed: %s", ICONS["error"], exc)
+            _run_errors.append(f"CSV write failed: {exc}")
+
+    # -----------------------------------------------------------------------
+    # Summary
+    # -----------------------------------------------------------------------
+    tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+    sep = f"{CYAN}{'─' * 60}{RESET}" if tty else "─" * 60
+    print(f"\n{sep}")
+    log.info("%s  Run complete", ICONS["done"])
+    log.info("     Prospects found : %d", len(prospects))
+    if skipped:
+        log.info("     No-email skipped: %d", skipped)
+    log.info("     Gmail drafts    : %d/%d", draft_ok, attempted)
+    if sheets_available:
+        log.info("     Sheets rows     : %d/%d", logged, draft_ok)
+    else:
+        log.info("     Output file     : prospects_output.csv")
+    if _run_errors:
+        log.warning("%s  %d error(s) this run:", ICONS["warn"], len(_run_errors))
+        for e in _run_errors:
+            log.warning("     %s", e)
+    else:
+        log.info("%s  No errors", ICONS["done"])
+    if draft_ok > 0:
+        log.info("     Drafts inbox    : https://mail.google.com/mail/#drafts")
+    print(sep)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# FINAL SUMMARY
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n" + "═" * 60)
-print("FLOW SUMMARY")
-print("═" * 60)
-print(f"  Prospects found:    {len(prospects)}")
-good_drafts = sum(1 for p in drafted if p.get("draft_id") not in ("error", "local_only"))
-print(f"  Gmail drafts:       {good_drafts}/{len(drafted)} created"
-      f"{' ✓' if good_drafts == len(drafted) else f'  ← {draft_errors} failed'}")
-if sheets_ok:
-    print(f"  Sheets logged:      {sheets_logged}/{len(drafted)} rows"
-          f"{' ✓' if sheets_logged == len(drafted) else f'  ← {len(drafted)-sheets_logged} failed'}")
-else:
-    print(f"  Sheets:             CSV fallback (googlesheets not configured)")
-
-if _errors:
-    print(f"\n  ⚠ {len(_errors)} error(s) during this run:")
-    for err in _errors:
-        print(f"    • {err}")
-else:
-    print("\n  ✓ No errors")
-
-if good_drafts > 0:
-    print(f"\n  Drafts inbox: https://mail.google.com/mail/#drafts")
-if sheets_ok:
-    print(f"  Sheet:        https://docs.google.com/spreadsheets/d/{SHEETS_ID}")
-print("═" * 60)
+if __name__ == "__main__":
+    main()

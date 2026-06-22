@@ -1,121 +1,221 @@
-# Outbound Prospecting Agent
+# Outbound Prospecting Agent (Apollo, Gmail, Google Sheets)
 
-Searches Apollo for ICP-matched contacts, drafts personalized Gmail outreach with an LLM, and logs everything to a Google Sheets tracker — so SDRs spend time selling, not on admin.
+> Search Apollo for ICP-matched prospects, draft personalized Gmail outreach, and log everything to Google Sheets — all without handling OAuth tokens directly.
 
-**Built with [Scalekit Agent Auth](https://scalekit.com).** All OAuth across Apollo, Gmail, and Google Sheets is handled by Scalekit — no token management, no refresh logic.
+**Built with [Scalekit Agent Auth](https://scalekit.com).** All OAuth across Apollo, Gmail, and Google Sheets is managed by Scalekit. The agent never stores or refreshes tokens.
 
-## What it does
+**Reference:** [scalekit.com/agent-templates](https://www.scalekit.com/agent-templates)
 
+---
+
+## Overview
+
+The agent runs a single pipeline on each invocation:
+
+1. Checks that all connectors are authorized via Scalekit.
+2. Searches Apollo for contacts matching your ICP (title, industry, headcount).
+3. Enriches each contact with buying signals and org context.
+4. Scores each prospect 0-100 against ICP criteria and picks the top results.
+5. Drafts a personalized outreach email per prospect using an LLM (OpenRouter) or a template fallback.
+6. Creates each email as a Gmail draft via the Gmail REST API using a Scalekit-managed token.
+7. Appends one row per prospect to a Google Sheet (name, company, score, signals, draft link).
+
+No email is ever sent automatically. SDRs review and send from Gmail drafts.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TD
+    A([run_flow.py]) --> B[Step 0\nConnector auth check]
+    B --> C[Step 1\napollo_search_contacts\napollo_enrich_contact]
+    C --> D[ICP scoring\n0-100 per prospect]
+    D --> E[Step 2\nLLM or template\nemail draft]
+    E --> F[Gmail REST API\ncreate draft]
+    F --> G[Step 3\ngooglesheets_append_values\nor CSV fallback]
+
+    B & C & F & G --> SK[(Scalekit\nActions API)]
+    SK --> AP([Apollo])
+    SK --> GM([Gmail])
+    SK --> SH([Google Sheets])
+
+    E --> OR([OpenRouter LLM\noptional])
+
+    style SK fill:#6366f1,color:#fff
+    style AP fill:#1a1a1a,color:#fff
+    style GM fill:#ea4335,color:#fff
+    style SH fill:#0f9d58,color:#fff
+    style OR fill:#4285f4,color:#fff
 ```
-1. Search   → Apollo: find contacts by title, industry, company size
-2. Enrich   → Apollo: add buying signals and org context per contact
-3. Score    → rank 0–100 against your ICP; top results advance
-4. Draft    → LLM writes a personalized email per prospect
-5. Gmail    → saves each email as a DRAFT (you review before sending)
-6. Sheets   → logs name, company, ICP score, signals, and draft link
-```
 
-## Quick start
+---
 
-### 1. Set up Scalekit connectors
+## Setup
 
-Go to [app.scalekit.com](https://app.scalekit.com) → **Agent Auth → Connections** and add:
+### 1. Create Scalekit connectors
 
-| Connection name | Service       |
-|-----------------|---------------|
-| `apollo`        | Apollo        |
-| `gmail`         | Gmail         |
-| `googlesheets`  | Google Sheets |
+Go to [app.scalekit.com](https://app.scalekit.com) > Agent Auth > Connections and add:
 
-Copy your API credentials from **Settings → API Credentials**.
+| Connection name | Service |
+|---|---|
+| `apollo` | Apollo |
+| `gmail` | Gmail |
+| `googlesheets` | Google Sheets |
 
-### 2. Configure environment
+Copy your API credentials from Settings > API Credentials.
+
+### 2. Prepare your Google Sheet
+
+Create a new Google Sheet. The agent writes these columns automatically:
+
+| Name | Company | Title | Email | ICP Score | Buying Signals | Email Subject | Draft Link |
+
+Copy the Sheet ID from the URL: `docs.google.com/spreadsheets/d/SHEET_ID/edit`
+
+### 3. Configure environment
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` with your credentials. Key values:
+Fill in `.env` (see [Environment Variables](#environment-variables) below). The agent prints a clear error listing any missing variables on startup.
 
-| Variable | Where to find it |
-|---|---|
-| `SCALEKIT_ENV_URL` | Scalekit dashboard — workspace URL |
-| `SCALEKIT_CLIENT_ID` | Settings → API Credentials |
-| `SCALEKIT_CLIENT_SECRET` | Settings → API Credentials |
-| `GMAIL_USER` | your Gmail address |
-| `SHEETS_USER` | your Google account email |
-| `SHEETS_ID` | the long ID in your Sheet URL |
-
-> **Finding your Sheet ID:** open your Google Sheet and copy the alphanumeric string from `docs.google.com/spreadsheets/d/**SHEET_ID**/edit`
-
-### 3. Install and run
+### 4. Install and run
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 python run_flow.py
 ```
 
-The first run checks auth for each connector. If any aren't authorized yet, a magic link is printed — open it, complete OAuth, press Enter. Every run after that goes straight through.
+On the first run, any connector that is not yet authorized will print a magic link. Open it in a browser, complete OAuth, press Enter. Every run after that goes straight through.
 
-**No Apollo account yet?**
+### 5. Run without Apollo (sample data mode)
 
 ```bash
 USE_SAMPLE_DATA=true python run_flow.py
 ```
 
-Skips Apollo entirely and uses five built-in sample prospects. Gmail drafts and Sheets logging still run against your real accounts.
+Skips Apollo entirely and uses five built-in sample prospects. Gmail drafts and Sheets logging still run against your real accounts. Good for testing the pipeline before setting up Apollo.
 
-## How it works
+---
+
+## What the output looks like
 
 ```
-Step 0 — Auth check
-  Scalekit verifies all connectors are ACTIVE.
-  Prints a magic link for any that need authorization.
+────────────────────────────────────────────────────────────
+  Outbound Prospecting Agent
+  Apollo -> Gmail Drafts -> Google Sheets via Scalekit
+────────────────────────────────────────────────────────────
+  Environment  : https://your-env.scalekit.dev
+  Sample data  : False
+  LLM drafting : OpenRouter (google/gemma-3-27b-it:free)
+  Prospect cap : 5
+────────────────────────────────────────────────────────────
 
-Step 1 — Find prospects
-  Calls apollo_search_contacts with your ICP filters (title, industry, headcount).
-  Calls apollo_enrich_contact for each result to add buying signals and org context.
-  Scores each prospect 0–100 against ICP criteria.
-  Takes the top PROSPECT_LIMIT results.
-
-Step 2 — Draft emails
-  LLM (OpenRouter) writes a personalized email anchored to real buying signals.
-  Falls back to a signal-aware template if no API key is configured.
-
-Step 3 — Gmail
-  Retrieves a fresh OAuth token from Scalekit's token vault.
-  Creates each email as a Gmail DRAFT via the Gmail REST API.
-  Never sends — the SDR reviews and sends when ready.
-
-Step 4 — Google Sheets
-  Appends one row per prospect: name, company, title, email, ICP score,
-  buying signals, email subject, and a direct link to the Gmail draft.
+10:00:01 | INFO     | ⚙  Step 0: Connector auth
+10:00:02 | INFO     | ✔  apollo — ACTIVE
+10:00:02 | INFO     | ✔  gmail — ACTIVE
+10:00:03 | INFO     | ✔  googlesheets — ACTIVE
+10:00:03 | INFO     | ⌕  Step 1: Finding prospects
+10:00:05 | INFO     | ✔  Apollo returned 15 prospect(s)
+10:00:07 | INFO     | ✔  Top 5 prospects by ICP score
+10:00:07 | INFO     | ✉  Step 2: Drafting Gmail emails
+10:00:07 | INFO     |    Sarah Chen | VP of Sales @ Nova HQ | score=80
+10:00:07 | INFO     |    Signals: Recent Series B ($28M), Hiring 4 AEs
+10:00:08 | INFO     | ✦  LLM draft OK
+10:00:09 | INFO     | ✔  Draft created -> sarah.chen@novahq.io
+10:00:09 | INFO     |    Subject : Quick question about Nova HQ's Series B momentum
+10:00:09 | INFO     |    Link    : https://mail.google.com/mail/#drafts/...
+10:00:15 | INFO     | ✔  Drafted 5/5
+10:00:15 | INFO     | ▦  Step 3: Logging to Google Sheets
+10:00:16 | INFO     | ✔  Sarah Chen @ Nova HQ -> Sheets
+10:00:20 | INFO     | ✔  Logged 5/5 rows
+────────────────────────────────────────────────────────────
+10:00:20 | INFO     | ✔  Run complete
+10:00:20 | INFO     |    Prospects found : 5
+10:00:20 | INFO     |    Gmail drafts    : 5/5
+10:00:20 | INFO     |    Sheets rows     : 5/5
+10:00:20 | INFO     | ✔  No errors
+10:00:20 | INFO     |    Drafts inbox: https://mail.google.com/mail/#drafts
+────────────────────────────────────────────────────────────
 ```
 
-## ICP scoring
+---
+
+## ICP Scoring
 
 | Factor | Points | Criteria |
-|--------|--------|----------|
-| Title match | 30 | Matches `ICP_TITLES` list |
-| Industry match | 25 | Matches `ICP_INDUSTRIES` list |
-| Company size | 20 | Within `ICP_EMP_MIN`–`ICP_EMP_MAX` range |
+|---|---|---|
+| Title match | 30 | Matches `ICP_TITLES` |
+| Industry match | 25 | Matches `ICP_INDUSTRIES` |
+| Company size | 20 | Within `ICP_EMP_MIN` to `ICP_EMP_MAX` |
 | Buying signals | up to 25 | 5 pts per signal, capped at 25 |
 
-All ICP criteria live in `.env` — no code changes needed to retarget.
+All ICP criteria are set in `.env` — no code changes needed to retarget.
 
-## Project structure
+---
+
+## Environment Variables
+
+### Required
+
+| Variable | Description |
+|---|---|
+| `SCALEKIT_ENV_URL` | Your Scalekit environment URL, e.g. `https://your-env.scalekit.dev` |
+| `SCALEKIT_CLIENT_ID` | Client ID from Scalekit Settings > API Credentials |
+| `SCALEKIT_CLIENT_SECRET` | Client secret from Scalekit Settings > API Credentials |
+| `GMAIL_USER` | Gmail address used to authorize the gmail connector |
+| `SHEETS_USER` | Google account email used to authorize the googlesheets connector |
+| `SHEETS_ID` | The alphanumeric ID from your Google Sheet URL |
+
+### Optional
+
+| Variable | Default | Description |
+|---|---|---|
+| `APOLLO_USER` | same as `GMAIL_USER` | Email for the apollo connector (if different) |
+| `SHEETS_RANGE` | `Sheet1!A:H` | Sheet tab and column range to append into |
+| `ICP_TITLES` | `VP of Sales,...` | Comma-separated list of target titles |
+| `ICP_INDUSTRIES` | `SaaS,Software,Technology` | Comma-separated list of target industries |
+| `ICP_EMP_MIN` | `50` | Minimum company headcount |
+| `ICP_EMP_MAX` | `5000` | Maximum company headcount |
+| `PROSPECT_LIMIT` | `5` | Max prospects to process per run |
+| `USE_SAMPLE_DATA` | `false` | Set to `true` to skip Apollo and use built-in sample prospects |
+| `OPENROUTER_API_KEY` | (none) | OpenRouter API key for LLM email drafting (falls back to template if not set) |
+| `OPENROUTER_MODEL` | `google/gemma-3-27b-it:free` | OpenRouter model to use |
+| `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+
+---
+
+## Troubleshooting
+
+| Error | Cause | Fix |
+|---|---|---|
+| `ValueError: Missing required env vars` | One or more vars not set in `.env` | Copy `.env.example` to `.env` and fill all values |
+| Connector prints a magic link on startup | Account not yet authorized in Scalekit | Open the link in a browser, complete OAuth, press Enter |
+| `apollo — connector not found` | Apollo connector not added in Scalekit | Add an `apollo` connection in Scalekit dashboard, or set `USE_SAMPLE_DATA=true` |
+| Apollo returns 0 prospects | ICP filters too narrow | Broaden `ICP_TITLES`, `ICP_INDUSTRIES`, or `ICP_EMP_MIN`/`MAX` in `.env` |
+| `Gmail draft failed: 401` | Gmail OAuth token expired or revoked | Re-authorize the gmail connector in Scalekit dashboard |
+| `Sheets append failed` | Wrong `SHEETS_ID` or missing sheet permissions | Check the Sheet ID in the URL; make sure the Google account has edit access |
+| LLM draft falls back to template | `OPENROUTER_API_KEY` not set or rate limited | Set `OPENROUTER_API_KEY` in `.env`, or leave blank to always use the template |
+| Output goes to `prospects_output.csv` | `SHEETS_ID` not configured | Set `SHEETS_ID` in `.env` to a real Google Sheet ID |
+
+---
+
+## Project Structure
 
 ```
-├── run_flow.py       main pipeline
-├── .env.example      environment template
-├── requirements.txt
-└── README.md
+run_flow.py           Main pipeline: auth -> search -> draft -> Gmail -> Sheets
+settings.py           Env var loading and validation (fails fast on missing vars)
+.env.example          Template with all required and optional variables
+requirements.txt      Dependencies: scalekit-sdk-python, requests, python-dotenv
 ```
 
-## Notes
+---
 
-- **Apollo:** enrichment credits are consumed per lookup — start with `PROSPECT_LIMIT=5` and increase gradually
-- **Gmail:** `gmail.compose` scope required — for internal Google Workspace use, no additional Google verification is needed
-- **Google Sheets:** the connector name in Scalekit must be `googlesheets` (not `google-sheets`)
-- **Scalekit token vault:** tokens for all three connectors are stored and auto-refreshed by Scalekit — no expiry handling needed in application code
-- **Sample mode:** `USE_SAMPLE_DATA=true` runs the full pipeline without an Apollo connector
+## SDK Versions
+
+- `scalekit-sdk-python >= 2.12.0`
+- Last verified: 2026-06-19
