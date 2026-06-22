@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Env
+.env
+
+# OS/editor
+.DS_Store
+.vscode/
+
+# State
+state/*.json
