@@ -12,6 +12,7 @@ import time
 import asyncio
 import logging
 import pathlib
+from typing import Optional, Literal
 
 # ---------------------------------------------------------------------------
 # Force native DNS resolver before any network imports (required on Python 3.13 + macOS)
@@ -110,7 +111,7 @@ SCALEKIT_CLIENT_ID     = os.getenv("SCALEKIT_CLIENT_ID", "")
 SCALEKIT_CLIENT_SECRET = os.getenv("SCALEKIT_CLIENT_SECRET", "")
 FRESHDESK_IDENTIFIER   = os.getenv("FRESHDESK_IDENTIFIER", "")
 FRESHDESK_CONNECTION   = os.getenv("FRESHDESK_CONNECTION", "freshdesk")
-GOOGLE_API_KEY         = os.getenv("GOOGLE_API_KEY", "")
+GOOGLE_API_KEY         = os.getenv("GOOGLE_ADK_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
 GEMINI_MODEL           = os.getenv("GOOGLE_ADK_MODEL", "gemini-2.0-flash")
 POLL_INTERVAL          = int(os.getenv("POLL_INTERVAL", "60"))
 STATE_FILE             = pathlib.Path(__file__).parent / "processed_tickets.json"
@@ -123,7 +124,7 @@ APP_NAME = "freshdesk_csat_agent"
 
 def validate_config() -> None:
     missing = []
-    if not SCALEKIT_ENV_URL or "scalekit" not in SCALEKIT_ENV_URL:
+    if not SCALEKIT_ENV_URL or "scalekit" not in SCALEKIT_ENV_URL or "yourenv" in SCALEKIT_ENV_URL:
         missing.append("SCALEKIT_ENV_URL")
     if not SCALEKIT_CLIENT_ID or SCALEKIT_CLIENT_ID == "your_scalekit_client_id":
         missing.append("SCALEKIT_CLIENT_ID")
@@ -248,152 +249,192 @@ def fd_update_status(ticket_id: str, status: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ADK client (lazy init)
+# ADK — structured output schema
 # ---------------------------------------------------------------------------
 
-_adk_agent = None
+from pydantic import BaseModel
+
+class CsatDecision(BaseModel):
+    feedback_received: bool
+    rating: Optional[int]
+    action: Optional[Literal["thank_and_close", "reopen_and_apologize"]]
 
 
-def _get_adk_agent():
-    global _adk_agent
-    if _adk_agent is not None:
-        return _adk_agent
-    try:
-        from google.adk.agents import LlmAgent
-        from google.adk.models.google_llm import Gemini
-        _adk_agent = LlmAgent(
-            name="csat_decision_agent",
-            model=Gemini(model=GEMINI_MODEL),
-            instruction=(
-                "You are a Freshdesk CSAT decision agent. "
-                "Given a ticket ID, requester email, and CSAT survey result JSON, decide what action to take. "
-                "rating 103 means satisfied, -103 means not satisfied. "
-                "Output ONLY valid JSON with exactly these keys: "
-                '{"feedback_received": true|false, "rating": 103|-103|null, '
-                '"action": "thank_and_close"|"reopen_and_apologize"|null}. '
-                "No markdown, no explanation, just the JSON object."
-            ),
-        )
-        log.info("%s  ADK agent initialised (model=%s)", ICONS["llm"], GEMINI_MODEL)
-        return _adk_agent
-    except Exception as exc:
-        log.error("%s  Failed to initialise ADK agent: %s", ICONS["error"], exc)
-        raise
+# ---------------------------------------------------------------------------
+# ADK runner (created once per poll cycle, reused across all tickets)
+# ---------------------------------------------------------------------------
+
+_adk_loop:    asyncio.AbstractEventLoop | None = None
+_adk_runner  = None
+_adk_session = None
 
 
-async def _run_adk_async(prompt: str) -> str | None:
-    """Run the ADK agent for a single prompt and return the text response."""
+def _get_event_loop() -> asyncio.AbstractEventLoop:
+    global _adk_loop
+    if _adk_loop is None or _adk_loop.is_closed():
+        _adk_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_adk_loop)
+    return _adk_loop
+
+
+def _build_runner(model: str):
+    """Create a fresh InMemoryRunner with the given model."""
+    from google.adk.agents import LlmAgent
+    from google.adk.models.google_llm import Gemini
     from google.adk import runners
+
+    agent = LlmAgent(
+        name="csat_decision_agent",
+        model=Gemini(model=model),
+        output_schema=CsatDecision,
+        output_key="decision",
+        instruction=(
+            "You are a Freshdesk CSAT decision agent. "
+            "Given a ticket ID, requester email, and CSAT survey result, decide the follow-up action. "
+            "rating=103 means satisfied, rating=-103 means not satisfied. "
+            "Set feedback_received=true if a CSAT rating is present. "
+            "Set action=thank_and_close for satisfied (103), "
+            "reopen_and_apologize for not satisfied (-103), null if unclear."
+        ),
+    )
+    return runners.InMemoryRunner(agent=agent, app_name=APP_NAME)
+
+
+async def _get_or_create_session(runner):
+    """Return the persistent session, creating it once per runner."""
+    global _adk_session
+    if _adk_session is None:
+        _adk_session = await runner.session_service.create_session(
+            app_name=APP_NAME, user_id="freshdesk_poller"
+        )
+        log.debug("ADK session created: %s", _adk_session.id)
+    return _adk_session
+
+
+async def _run_adk_async(runner, prompt: str) -> CsatDecision | None:
+    """Run one ADK invocation and return the structured CsatDecision."""
     from google.genai import types as genai_types
 
-    agent  = _get_adk_agent()
-    runner = runners.InMemoryRunner(agent=agent, app_name=APP_NAME)
-    session = await runner.session_service.create_session(
-        app_name=APP_NAME, user_id="freshdesk_poller"
-    )
+    session = await _get_or_create_session(runner)
     msg = genai_types.Content(
         role="user",
         parts=[genai_types.Part(text=prompt)],
     )
-    texts = []
     async for ev in runner.run_async(
         user_id="freshdesk_poller",
         session_id=session.id,
         new_message=msg,
     ):
-        content = getattr(ev, "content", None)
-        if not content:
-            continue
-        for part in getattr(content, "parts", []):
-            t = getattr(part, "text", None)
-            if t:
-                texts.append(t)
-    return "\n".join(texts) if texts else None
-
-
-def _strip_fences(s: str) -> str:
-    s = s.strip()
-    if s.startswith("```json"):
-        s = s[7:]
-    elif s.startswith("```"):
-        s = s[3:]
-    if s.endswith("```"):
-        s = s[:-3]
-    return s.strip()
+        if ev.is_final_response():
+            # output_schema writes result into session state under output_key
+            state = (await runner.session_service.get_session(
+                app_name=APP_NAME,
+                user_id="freshdesk_poller",
+                session_id=session.id,
+            )).state
+            decision = state.get("decision")
+            if decision is None:
+                return None
+            if isinstance(decision, CsatDecision):
+                return decision
+            # ADK may store it as a dict when loaded from session state
+            if isinstance(decision, dict):
+                return CsatDecision(**decision)
+    return None
 
 
 def get_adk_decision(ticket_id: str, survey_result: dict | None, email: str | None) -> dict | None:
     """
     Ask Gemini to decide the action for this ticket.
     Returns dict with: feedback_received, rating, action — or None on failure.
+    Uses output_schema for structured output (no text parsing, no JSON.loads).
+    Runner and session are reused across calls within the same poll cycle.
     """
+    global _adk_runner, _adk_session
+
     prompt = (
         f"Ticket ID: {ticket_id}. "
         f"Requester: {email or 'unknown'}. "
-        f"Survey Result JSON:\n{json.dumps(survey_result or {}, ensure_ascii=False)}"
+        f"Survey result: {json.dumps(survey_result or {}, ensure_ascii=False)}"
     )
-    log.debug("ADK prompt: %s", prompt)
+    log.debug("ADK prompt prepared for ticket %s", ticket_id)
 
-    model_candidates = list(dict.fromkeys(filter(None, [
-        GEMINI_MODEL,
+    # Fallback list only used if the primary model fails
+    fallback_models = list(dict.fromkeys(filter(None, [
         "gemini-2.5-flash",
         "gemini-2.0-flash",
         "gemini-2.5-pro",
     ])))
 
-    for model in model_candidates:
-        try:
-            if model != GEMINI_MODEL:
-                log.warning("%s  Retrying with fallback model: %s", ICONS["warn"], model)
-                from google.adk.agents import LlmAgent
-                from google.adk.models.google_llm import Gemini
-                global _adk_agent
-                _adk_agent = LlmAgent(
-                    name="csat_decision_agent",
-                    model=Gemini(model=model),
-                    instruction=_get_adk_agent().instruction,
-                )
+    loop = _get_event_loop()
 
-            raw = asyncio.run(_run_adk_async(prompt))
-            log.debug("ADK raw output: %s", raw)
+    # --- Primary model attempt (reuse existing runner if available) ---
+    try:
+        if _adk_runner is None:
+            log.info("%s  ADK agent initialised (model=%s)", ICONS["llm"], GEMINI_MODEL)
+            _adk_runner = _build_runner(GEMINI_MODEL)
 
-            if not raw:
-                log.warning("%s  ADK returned empty response for ticket %s", ICONS["warn"], ticket_id)
-                continue
+        decision: CsatDecision | None = loop.run_until_complete(
+            _run_adk_async(_adk_runner, prompt)
+        )
 
-            try:
-                parsed = json.loads(_strip_fences(raw))
-            except json.JSONDecodeError:
-                log.warning("%s  ADK response was not valid JSON for ticket %s: %s",
-                            ICONS["warn"], ticket_id, raw[:200])
-                parsed = {"feedback_received": False, "rating": None, "action": None}
-
-            # Normalise rating field in case model returns a string
-            rating = parsed.get("rating")
-            if isinstance(rating, str):
-                low = rating.strip().lower()
-                if low in ("satisfied", "positive", "good", "happy", "103"):
-                    rating = 103
-                elif low in ("not_satisfied", "negative", "bad", "unhappy", "-103"):
-                    rating = -103
-                elif rating.lstrip("-").isdigit():
-                    rating = int(rating)
-                else:
-                    rating = None
-
+        if decision is not None:
+            log.debug("ADK decision: %s", decision)
             return {
-                "feedback_received": bool(parsed.get("feedback_received")),
-                "rating":            rating,
-                "action":            parsed.get("action"),
+                "feedback_received": decision.feedback_received,
+                "rating":            decision.rating,
+                "action":            decision.action,
             }
 
+        log.warning("%s  ADK returned no structured decision for ticket %s (primary)",
+                    ICONS["warn"], ticket_id)
+
+    except Exception as exc:
+        log.warning("%s  ADK primary model %s failed for ticket %s: %s",
+                    ICONS["warn"], GEMINI_MODEL, ticket_id, exc)
+
+    _adk_runner  = None
+    _adk_session = None
+
+    # --- Fallback models (only reached if primary failed) ---
+    for model in fallback_models:
+        if model == GEMINI_MODEL:
+            continue  # already tried
+        try:
+            log.warning("%s  Retrying with fallback model: %s", ICONS["warn"], model)
+            _adk_runner  = _build_runner(model)
+            _adk_session = None
+
+            decision = loop.run_until_complete(
+                _run_adk_async(_adk_runner, prompt)
+            )
+
+            if decision is not None:
+                log.debug("ADK decision (fallback %s): %s", model, decision)
+                return {
+                    "feedback_received": decision.feedback_received,
+                    "rating":            decision.rating,
+                    "action":            decision.action,
+                }
+
+            log.warning("%s  Fallback model %s returned no decision for ticket %s",
+                        ICONS["warn"], model, ticket_id)
+
         except Exception as exc:
-            log.warning("%s  ADK model %s failed for ticket %s: %s",
+            log.warning("%s  Fallback model %s failed for ticket %s: %s",
                         ICONS["warn"], model, ticket_id, exc)
-            continue
+            _adk_runner  = None
+            _adk_session = None
 
     log.error("%s  All ADK model candidates failed for ticket %s", ICONS["error"], ticket_id)
     return None
+
+
+def reset_adk() -> None:
+    """Reset ADK state between poll cycles so sessions don't grow unbounded."""
+    global _adk_runner, _adk_session
+    _adk_runner  = None
+    _adk_session = None
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +491,7 @@ def process_ticket(ticket: dict, state: set) -> bool:
     requester_email = requester.get("email") or ticket.get("requester_email")
     subject        = (ticket.get("subject") or "")[:60]
 
-    log.info("%s  Ticket #%s | %s | %s", ICONS["ticket"], ticket_id, requester_email or "no-email", subject)
+    log.info("%s  Ticket #%s | %s", ICONS["ticket"], ticket_id, subject)
 
     # Fetch CSAT
     survey = fd_get_survey(ticket_id)
@@ -459,9 +500,6 @@ def process_ticket(ticket: dict, state: set) -> bool:
         log.info("%s  Survey found for ticket #%s — rating=%s", ICONS["survey"], ticket_id, rating_raw)
     else:
         log.info("%s  No survey result for ticket #%s — skipping", ICONS["skip"], ticket_id)
-        # Mark as seen so we don't keep polling tickets with no survey
-        state.add(ticket_id)
-        save_state(state)
         return False
 
     # Ask ADK
@@ -522,8 +560,8 @@ def _banner() -> None:
     print(f"{CYAN}{BOLD}  Freshdesk CSAT Follow-up Agent{RESET}")
     print(f"{GREY}  Watches resolved tickets and acts on CSAT survey results{RESET}")
     print(line)
-    print(f"  {GREY}Freshdesk identifier :{RESET} {WHITE}{FRESHDESK_IDENTIFIER}{RESET}")
-    print(f"  {GREY}Scalekit env         :{RESET} {WHITE}{SCALEKIT_ENV_URL}{RESET}")
+    print(f"  {GREY}Freshdesk identifier :{RESET} {WHITE}{'*' * 4 + FRESHDESK_IDENTIFIER[-4:] if len(FRESHDESK_IDENTIFIER) > 4 else '****'}{RESET}")
+    print(f"  {GREY}Scalekit env         :{RESET} {WHITE}{SCALEKIT_ENV_URL.split('//')[1] if '//' in SCALEKIT_ENV_URL else SCALEKIT_ENV_URL}{RESET}")
     print(f"  {GREY}Gemini model         :{RESET} {WHITE}{GEMINI_MODEL}{RESET}")
     print(f"  {GREY}Poll interval        :{RESET} {WHITE}{POLL_INTERVAL}s{RESET}")
     print(f"  {GREY}State file           :{RESET} {WHITE}{STATE_FILE}{RESET}")
@@ -552,11 +590,12 @@ def poll() -> None:
         log.error("%s  Cannot connect to Scalekit: %s", ICONS["error"], exc)
         sys.exit(1)
 
-    # Pre-warm ADK agent at startup
+    # Pre-warm ADK runner at startup to catch bad API keys before first poll
     try:
-        _get_adk_agent()
+        _build_runner(GEMINI_MODEL)
+        log.info("%s  ADK agent initialised (model=%s)", ICONS["llm"], GEMINI_MODEL)
     except Exception as exc:
-        log.error("%s  Cannot initialise ADK agent — check GOOGLE_ADK_API_KEY: %s",
+        log.error("%s  Cannot initialise ADK agent - check GOOGLE_ADK_API_KEY: %s",
                   ICONS["error"], exc)
         sys.exit(1)
 
@@ -581,7 +620,7 @@ def poll() -> None:
                 else:
                     skipped += 1
 
-            log.info("%s  Poll complete — processed=%d skipped=%d",
+            log.info("%s  Poll complete - processed=%d skipped=%d",
                      ICONS["done"], processed, skipped)
 
         except RuntimeError as exc:
@@ -591,6 +630,10 @@ def poll() -> None:
             if consecutive_errors >= 5:
                 log.error("%s  5 consecutive poll failures — check Scalekit credentials and network.",
                           ICONS["error"])
+
+        # Reset ADK runner/session between poll cycles so session history
+        # doesn't grow unbounded across hundreds of polls
+        reset_adk()
 
         log.info("%s  Next poll in %ds...", ICONS["poll"], POLL_INTERVAL)
         time.sleep(POLL_INTERVAL)

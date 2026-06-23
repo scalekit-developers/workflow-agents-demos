@@ -29,7 +29,7 @@ flowchart TD
     C -- No --> D[Skip]
     C -- Yes --> E[freshdesk_ticket_get\nfetch CSAT survey]
     E --> F{Survey\nfound?}
-    F -- No --> G[Mark seen\nskip this poll]
+    F -- No --> G[Skip\nretry next poll]
     F -- Yes --> H[Google ADK\nGemini LlmAgent]
     H --> I{Decision}
     I -- thank_and_close\nrating=103 --> J[freshdesk_tickets_reply\nThank you message]
@@ -118,13 +118,13 @@ The agent runs continuously, polling every 60 seconds by default. Press Ctrl+C t
 10:00:01 | INFO     | ▶  Loaded 12 already-processed ticket IDs from state
 10:00:01 | INFO     | ⌕  Polling Freshdesk for resolved tickets...
 10:00:02 | INFO     | ✔  Fetched 3 resolved ticket(s)
-10:00:02 | INFO     | 🎫  Ticket #1042 | alice@acme.com | Login broken after update
+10:00:02 | INFO     | 🎫  Ticket #1042 | Login broken after update
 10:00:02 | INFO     | ★  Survey found for ticket #1042, rating=103
 10:00:02 | INFO     | ✦  Asking ADK for decision on ticket #1042...
 10:00:03 | INFO     | ⚡  Decision for ticket #1042: action=thank_and_close rating=103
 10:00:03 | INFO     | ✔  Thanking and closing ticket #1042
 10:00:03 | INFO     | ✔  Ticket #1042 done and saved to state
-10:00:04 | INFO     | 🎫  Ticket #1043 | bob@corp.com | Export not working
+10:00:04 | INFO     | 🎫  Ticket #1043 | Export not working
 10:00:04 | INFO     | ★  Survey found for ticket #1043, rating=-103
 10:00:04 | INFO     | ✦  Asking ADK for decision on ticket #1043...
 10:00:05 | INFO     | ⚡  Decision for ticket #1043: action=reopen_and_apologize rating=-103
@@ -196,7 +196,7 @@ The agent only processes tickets with status 4 (Resolved). It sets status to 5 (
 
 ## SDK Versions
 
-- `google-adk==1.18.0`
+- `google-adk==1.28.1`
 - `scalekit-sdk-python==2.12.0`
 - `python-dotenv==1.2.1`
 - Last verified: 2026-06-23
