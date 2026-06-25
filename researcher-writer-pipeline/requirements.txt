@@ -1,0 +1,10 @@
+crewai
+crewai-tools
+openai
+requests
+python-dotenv
+langchain-core>=0.2.29
+langchain>=0.2.16
+langchain-openai>=0.1.22
+readability-lxml
+beautifulsoup4

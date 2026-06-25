@@ -1,0 +1,27 @@
+# Python virtual environment
+.venv/
+
+# Environment variables
+.env
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Distribution / packaging
+.Python
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log
+*.out
+*.err
+
+# IDE settings
+.vscode/
+.idea/
+
+# State or cache
+state/

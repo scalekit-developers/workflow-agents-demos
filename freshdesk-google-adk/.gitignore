@@ -1,0 +1,8 @@
+# Ignore Python cache and environment files
+__pycache__/
+*.pyc
+.venv/
+.env
+processed_tickets.json
+# VSCode
+.vscode/
