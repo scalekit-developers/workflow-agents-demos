@@ -98,7 +98,11 @@ def parse_entities(subject: str, body_raw: str, headers: Dict, *,
         return ParsedEmail(title=subject or "Meeting", attendees=[])
 
     tz_str = extracted.get("timezone") or user_tz
-    local_tz = pytz.timezone(tz_str)
+    try:
+        local_tz = pytz.timezone(tz_str)
+    except pytz.UnknownTimeZoneError:
+        tz_str = user_tz
+        local_tz = pytz.timezone(user_tz)
 
     hard_start: Optional[datetime] = None
     hard_end: Optional[datetime] = None
@@ -119,7 +123,8 @@ def parse_entities(subject: str, body_raw: str, headers: Dict, *,
         except Exception:
             hard_end = None
 
-    duration = int(extracted.get("duration_minutes") or default_duration)
+    raw_duration = extracted.get("duration_minutes")
+    duration = int(raw_duration) if isinstance(raw_duration, (int, float)) else default_duration
     if hard_start and not hard_end:
         hard_end = hard_start + timedelta(minutes=duration)
     if hard_start and hard_end:
@@ -128,7 +133,10 @@ def parse_entities(subject: str, body_raw: str, headers: Dict, *,
     # Merge LLM attendees + header emails, deduplicate
     seen: set = set()
     attendees: List[Attendee] = []
-    for e in (extracted.get("attendees") or []) + header_emails:
+    raw_attendees = extracted.get("attendees") or []
+    for e in raw_attendees + header_emails:
+        if not isinstance(e, str) or not e.strip():
+            continue
         if e.lower() not in seen:
             seen.add(e.lower())
             attendees.append(Attendee(email=e))

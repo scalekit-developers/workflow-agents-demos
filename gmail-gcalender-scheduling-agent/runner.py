@@ -96,9 +96,33 @@ def _headers_dict(message: dict) -> dict:
 def _reply_to(headers: dict) -> str:
     """Extract bare email address from Reply-To or From header."""
     raw = headers.get("Reply-To") or headers.get("From") or ""
-    # Strip display name: "Name <email>" → "email"
     m = re.search(r"<([^>]+)>", raw)
     return m.group(1).strip() if m else raw.strip()
+
+
+def _extract_body(message: dict) -> str:
+    """Walk Gmail payload parts and return decoded plain-text body."""
+    import base64
+
+    def _decode(data: str) -> str:
+        try:
+            return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    def _walk(part: dict) -> str:
+        mime = part.get("mimeType", "")
+        body_data = (part.get("body") or {}).get("data", "")
+        if mime == "text/plain" and body_data:
+            return _decode(body_data)
+        for sub in part.get("parts") or []:
+            text = _walk(sub)
+            if text:
+                return text
+        return ""
+
+    payload = message.get("payload") or {}
+    return _walk(payload)
 
 # ---------------------------------------------------------------------------
 # Banner
@@ -141,7 +165,7 @@ def process_message(identifier: str, msg_stub: dict, processed: set) -> bool:
         (h["value"] for h in (full.get("payload") or {}).get("headers", [])
          if h.get("name") == "Subject"), ""
     ) or "(no subject)"
-    body = full.get("snippet") or ""
+    body = _extract_body(full) or full.get("snippet") or ""
 
     log.info("%s  %s", ICONS["email"], subject[:80])
 
@@ -149,7 +173,8 @@ def process_message(identifier: str, msg_stub: dict, processed: set) -> bool:
     log.debug("%s  Parsing email for scheduling intent...", ICONS["llm"])
     ent = parse_entities(subject, body, headers, user_tz=USER_TZ, default_duration=DEFAULT_DURATION)
 
-    if not ent.hard_start:
+    # LLM returned no scheduling intent at all (is_scheduling=false)
+    if not ent.hard_start and not ent.title:
         log.info("%s  No scheduling intent found — skipping", ICONS["skip"])
         try:
             mark_read(identifier, msg_id)
@@ -159,25 +184,28 @@ def process_message(identifier: str, msg_stub: dict, processed: set) -> bool:
         processed.add(msg_id)
         return False
 
-    log.info("%s  Intent: '%s' | %s | %dmin",
-             ICONS["cal"], ent.title,
-             ent.hard_start.strftime("%a %b %d %H:%M %Z"),
-             ent.duration_minutes)
-
-    # Free/busy check
     cal_id = get_primary_calendar_id(identifier)
     now = datetime.now(LOCAL_TZ)
     busy = get_busy_slots(identifier, iso(now - timedelta(days=1)),
                           iso(now + timedelta(days=30)), LOCAL_TZ)
     log.debug("%s  %d busy block(s) on calendar", ICONS["cal"], len(busy))
 
-    proposed_start = ent.hard_start.astimezone(LOCAL_TZ)
-    proposed_end = (
-        ent.hard_end.astimezone(LOCAL_TZ) if ent.hard_end
-        else proposed_start + timedelta(minutes=ent.duration_minutes)
-    )
-
-    conflict = any(proposed_start < b1 and proposed_end > b0 for b0, b1 in busy)
+    if ent.hard_start:
+        log.info("%s  Intent: '%s' | %s | %dmin",
+                 ICONS["cal"], ent.title,
+                 ent.hard_start.strftime("%a %b %d %H:%M %Z"),
+                 ent.duration_minutes)
+        proposed_start = ent.hard_start.astimezone(LOCAL_TZ)
+        proposed_end = (
+            ent.hard_end.astimezone(LOCAL_TZ) if ent.hard_end
+            else proposed_start + timedelta(minutes=ent.duration_minutes)
+        )
+        conflict = any(proposed_start < b1 and proposed_end > b0 for b0, b1 in busy)
+    else:
+        # Flex scheduling request ("can we meet this week?") — find next free slot
+        log.info("%s  Flex scheduling intent: '%s' | %dmin — finding slot",
+                 ICONS["cal"], ent.title, ent.duration_minutes)
+        conflict = True  # force slot suggestion path
 
     if conflict:
         log.info("%s  Conflict at proposed time — finding alternatives", ICONS["warn"])
@@ -222,7 +250,7 @@ def process_message(identifier: str, msg_stub: dict, processed: set) -> bool:
             f"A calendar invite has been sent to all attendees.\n"
             + (f"\nEvent: {event_link}\n" if event_link else "")
             + "\nBest regards"
-        ).encode("ascii", errors="replace").decode("ascii")
+        )
         draft_subject = f"Re: {subject}"[:100]
         try:
             draft = create_draft(identifier, to=reply_to,

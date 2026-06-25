@@ -114,8 +114,8 @@ The agent runs continuously, polling every 60 seconds. Press Ctrl+C to stop.
 ────────────────────────────────────────────────────────────
 
 10:00:01 | INFO     | Checking Scalekit connections...
-10:00:02 | INFO     | ✔  gmail connected for parv@infrasity.com
-10:00:02 | INFO     | ✔  googlecalendar connected for parv@infrasity.com
+10:00:02 | INFO     | ✔  gmail connected for user@example.com
+10:00:02 | INFO     | ✔  googlecalendar connected for user@example.com
 10:00:02 | INFO     | ✔  Both connections active
 10:00:02 | INFO     | ⌕  Polling Gmail for scheduling emails...
 10:00:03 | INFO     | ⌕  Found 2 unread email(s) to process
@@ -191,6 +191,6 @@ The agent runs continuously, polling every 60 seconds. Press Ctrl+C to stop.
 ## SDK Versions
 
 - `scalekit-sdk-python==2.12.0`
-- `python-dotenv>=1.0.0`
-- `requests>=2.31.0`
+- `anthropic==0.112.0`
+- `requests==2.32.4`
 - Last verified: 2026-06-25

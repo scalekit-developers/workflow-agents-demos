@@ -30,21 +30,18 @@ def get_primary_calendar_id(identifier: str) -> str:
 
 def list_events(identifier: str, calendar_id: str,
                 time_min: str, time_max: str, max_results: int = 250) -> List[Dict]:
-    try:
-        data = execute_tool(
-            "googlecalendar_list_events",
-            {
-                "calendarId": calendar_id,
-                "timeMin": time_min,
-                "timeMax": time_max,
-                "singleEvents": True,
-                "orderBy": "startTime",
-                "maxResults": max_results,
-            },
-            identifier,
-        )
-    except Exception:
-        return []
+    data = execute_tool(
+        "googlecalendar_list_events",
+        {
+            "calendarId": calendar_id,
+            "timeMin": time_min,
+            "timeMax": time_max,
+            "singleEvents": True,
+            "orderBy": "startTime",
+            "maxResults": max_results,
+        },
+        identifier,
+    )
     if isinstance(data, dict):
         return data.get("items") or data.get("events") or []
     if isinstance(data, list):
@@ -69,20 +66,20 @@ def create_event(identifier: str, calendar_id: str, event: Dict[str, Any]) -> Di
     if not start_dt or not end_dt:
         raise ValueError("create_event: start/end datetime required")
 
-    # Conflict check
+    # Conflict check — query only around the requested event window
     local_tz = pytz.timezone(tz)
-    busy = get_busy_slots(
-        identifier,
-        iso(datetime.now(pytz.UTC) - timedelta(days=1)),
-        iso(datetime.now(pytz.UTC) + timedelta(days=30)),
-        local_tz,
-    )
     s = datetime.fromisoformat(start_dt)
     e = datetime.fromisoformat(end_dt)
     if not s.tzinfo:
         s = local_tz.localize(s)
     if not e.tzinfo:
         e = local_tz.localize(e)
+    busy = get_busy_slots(
+        identifier,
+        iso(s - timedelta(hours=1)),
+        iso(e + timedelta(hours=1)),
+        local_tz,
+    )
     for b0, b1 in busy:
         if overlaps(s, e, b0, b1):
             return {"error": "Conflict with existing event — choose another time."}
