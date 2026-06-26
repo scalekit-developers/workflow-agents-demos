@@ -107,7 +107,7 @@ CONNECTOR_USERS = {
 AE_EMAIL          = os.environ["AE_EMAIL"]
 SLACK_DM_USER     = os.environ["SLACK_DM_USER"]
 LOOKAHEAD_MIN     = int(os.getenv("LOOKAHEAD_MINUTES", "10080"))
-BRIEF_BEFORE_MIN  = int(os.getenv("BRIEF_BEFORE_MINUTES", "15"))
+BRIEF_BEFORE_MIN  = int(os.getenv("BRIEF_BEFORE_MINUTES", "5"))
 POLL_INTERVAL_MIN = int(os.getenv("POLL_INTERVAL_MINUTES", "15"))
 POLLING_MODE      = os.getenv("POLLING_MODE", "false").lower() == "true"
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
@@ -240,18 +240,30 @@ def get_upcoming_external_meetings() -> list[dict]:
     ae_domain = AE_EMAIL.split("@")[-1].lower()
 
     log.debug("%s  Fetching calendar events for next %d min", ICONS["cal"], LOOKAHEAD_MIN)
-    events_data = _tool(
-        "googlecalendar", "googlecalendar_list_events",
-        calendar_id="primary",
-        time_min=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        time_max=window.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        single_events=True,
-        order_by="startTime",
-        max_results=20,
-    )
+    time_min = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    time_max = window.strftime("%Y-%m-%dT%H:%M:%SZ")
+    all_events: list[dict] = []
+    page_token: str | None = None
+    while True:
+        kwargs: dict = dict(
+            calendar_id="primary",
+            time_min=time_min,
+            time_max=time_max,
+            single_events=True,
+            order_by="startTime",
+            max_results=100,
+        )
+        if page_token:
+            kwargs["page_token"] = page_token
+        page_data = _tool("googlecalendar", "googlecalendar_list_events", **kwargs)
+        events_page = page_data.get("events") or page_data.get("items") or []
+        all_events.extend(events_page)
+        page_token = page_data.get("nextPageToken")
+        if not page_token or not events_page:
+            break
 
     meetings = []
-    for ev in (events_data.get("events") or events_data.get("items") or []):
+    for ev in all_events:
         attendees = ev.get("attendees") or []
         external = [
             a for a in attendees
@@ -547,6 +559,7 @@ Rules:
         model=CLAUDE_MODEL,
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
+        timeout=120,
     )
     return msg.content[0].text.strip()
 
@@ -581,11 +594,15 @@ def send_slack_brief(event: dict, brief: str, deal: dict, granola_notes: list[di
     )
 
     if SLACK_CONNECTOR in _unavailable:
-        log.warning("%s  Slack unavailable — printing brief to stdout instead",
-                    ICONS["warn"])
-        print("\n" + "─" * 60)
-        print(message)
-        print("─" * 60 + "\n")
+        if os.getenv("BRIEF_STDOUT_FALLBACK", "").lower() == "true":
+            log.warning("%s  Slack unavailable — printing brief to stdout (BRIEF_STDOUT_FALLBACK=true)",
+                        ICONS["warn"])
+            print("\n" + "─" * 60)
+            print(message)
+            print("─" * 60 + "\n")
+        else:
+            log.warning("%s  Slack unavailable — brief not sent (set BRIEF_STDOUT_FALLBACK=true to print to stdout)",
+                        ICONS["warn"])
         return
 
     client = _get_client()
