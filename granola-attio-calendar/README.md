@@ -6,6 +6,8 @@
 
 No tokens to manage. No OAuth flows to build. Scalekit handles all of it.
 
+**Reference template:** [scalekit.com/agent-templates/deal-intelligence-agent](https://www.scalekit.com/agent-templates/deal-intelligence-agent)
+
 ---
 
 ## What it does
@@ -31,7 +33,7 @@ flowchart TD
     A([Poll Loop\nevery 15 min]) --> B[googlecalendar_list_events\nvia Scalekit]
     B --> C{External\nmeeting in\nnext 7 days?}
     C -- No --> D[Sleep]
-    C -- Yes --> E[granolamcp_query_meetings\npast notes + transcripts]
+    C -- Yes --> E[granolamcp_query_granola_meetings\npast notes + transcripts]
     E --> F[attio_search_records\ndeal + stage lookup]
     F --> G[Claude\nsynthesize 1-page brief]
     G --> H[slack_send_message\nDM to AE]
@@ -117,7 +119,7 @@ ANTHROPIC_API_KEY=sk-ant-api03-...
 LOOKAHEAD_MINUTES=10080     # 7 days — look ahead a full week for meetings
 BRIEF_BEFORE_MINUTES=5      # skip meetings starting in less than 5 min
 POLL_INTERVAL_MINUTES=15    # only used when POLLING_MODE=true
-POLLING_MODE=false           # true = run forever, false = run once and exit
+POLLING_MODE=true            # true = run forever every 15 min, false = run once and exit
 ```
 
 ### Step 4 — Authorize each connector (first run only)
@@ -170,21 +172,27 @@ As a cron job (every 15 min on weekdays 9am–6pm):
   LLM model    : claude-haiku-4-5-20251001
 ────────────────────────────────────────────────────────────
 
-12:47:53 | INFO     | 🔑  Checking Scalekit connector auth...
-12:47:55 | INFO     | ✔  googlecalendar connected for user@example.com
-12:47:56 | INFO     | ✔  granolamcp connected for user@example.com
-12:47:56 | INFO     | ✔  attio connected for user@example.com
-12:47:57 | INFO     | ✔  slack connected for user@example.com
-12:47:57 | INFO     | ⌕  Poll cycle: 2026-06-26 12:47:57
-12:47:57 | INFO     | 📅  Checking upcoming calendar events (next 10080 min)...
-12:47:58 | INFO     | 📅  Found 2 external meeting(s)
-12:47:58 | INFO     | 📅  'TechVista Demo Call' | starts in 4812 min | attendees: cto@techvista.io
-12:48:00 | INFO     | 📝  0 prior meeting(s) found in Granola
-12:48:00 | INFO     | 💼  Deal: TechVista Enterprise | Stage: Proposal | Value: $48000
-12:48:02 | INFO     | ✦   Synthesizing prep brief via Claude...
-12:48:09 | INFO     | ✦   Brief ready (1419 chars)
-12:48:09 | INFO     | 💬  Brief sent for 'TechVista Demo Call' (ts=1782458289.618169)
-12:48:09 | INFO     | ✔  Poll cycle complete
+16:08:03 | INFO     | 🔑  Checking Scalekit connector auth...
+16:08:07 | INFO     | ✔  googlecalendar connected for team@infrasity.com
+16:08:07 | INFO     | ✔  granolamcp connected for parv@infrasity.com
+16:08:08 | INFO     | ✔  attio connected for parv@infrasity.com
+16:08:08 | INFO     | ✔  slack-sKfekCVz connected for team@infrasity.com
+16:08:08 | INFO     | ⌕  Polling every 15 min (Ctrl+C to stop)
+16:08:08 | INFO     | ⌕  Poll cycle: 2026-06-26 16:08:08
+16:08:08 | INFO     | 📅  Checking upcoming calendar events (next 10080 min)...
+16:08:09 | INFO     | 📅  Found 2 external meeting(s)
+16:08:09 | INFO     | 📅  '[GoLive]Migration SoftwareForge' | starts in 4611 min | attendees: nassir@opsera.io
+16:08:20 | INFO     | 📝  0 prior meeting(s) found in Granola
+16:08:23 | INFO     | –  No deal found in Attio — new prospect
+16:08:29 | INFO     | ✦  Brief ready (1490 chars)
+16:08:30 | INFO     | 💬  Brief sent for '[GoLive]Migration SoftwareForge' (ts=1782470310.113849)
+16:08:30 | INFO     | 📅  'Lightrun <> Infrasity Weekly Meeting' | starts in 8631 min | attendees: gidif@lightrun.com
+16:08:40 | INFO     | 📝  0 prior meeting(s) found in Granola
+16:08:42 | INFO     | –  No deal found in Attio — new prospect
+16:08:47 | INFO     | ✦  Brief ready (1531 chars)
+16:08:48 | INFO     | 💬  Brief sent for 'Lightrun <> Infrasity Weekly Meeting' (ts=1782470328.243999)
+16:08:48 | INFO     | ✔  Poll cycle complete
+16:08:48 | INFO     | ⌕  Next poll in 15 min...
 ```
 
 ---
@@ -216,7 +224,7 @@ As a cron job (every 15 min on weekdays 9am–6pm):
 | `LOOKAHEAD_MINUTES` | `10080` | Look ahead for meetings (default: 7 days) |
 | `BRIEF_BEFORE_MINUTES` | `5` | Skip meetings starting sooner than this |
 | `POLL_INTERVAL_MINUTES` | `15` | How often to poll in polling mode |
-| `POLLING_MODE` | `false` | `true` = run forever, `false` = one-shot |
+| `POLLING_MODE` | `true` | `true` = run forever every 15 min, `false` = one-shot and exit |
 | `LOG_LEVEL` | `INFO` | `DEBUG` for verbose output, `INFO` for normal |
 
 ---
