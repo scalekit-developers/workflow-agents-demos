@@ -470,7 +470,7 @@ def build_digest(eng: dict, prs: list, mrs: list, issues: list) -> str:
 
 
 # ── Step 5: Post to Slack ──────────────────────────────────────────────────────
-def post_digest_to_slack(eng: dict, digest: str) -> None:
+def post_digest_to_slack(eng: dict, digest: str) -> bool:
     """
     Post the standup digest to the engineer's Slack DM.
 
@@ -483,7 +483,7 @@ def post_digest_to_slack(eng: dict, digest: str) -> None:
 
     if not slack_user_id:
         log.warning("%s    No slack_user_id configured for %s — skipping Slack post", ICONS["warn"], eng["name"])
-        return
+        return False
 
     try:
         result = connect.execute_tool(
@@ -494,6 +494,7 @@ def post_digest_to_slack(eng: dict, digest: str) -> None:
         )
         ts = (result.data or {}).get("timestamp") or (result.data or {}).get("ts") or ""
         log.info("%s    Posted to %s (ts=%s)", ICONS["done"], slack_user_id, ts)
+        return True
     except Exception as slack_err:
         err_str = str(slack_err)
         if "token_expired" in err_str or "INVALID_ARGUMENT" in err_str:
@@ -507,6 +508,7 @@ def post_digest_to_slack(eng: dict, digest: str) -> None:
                 log.warning("    Go to app.scalekit.com → Agent Auth → Connections → %s → re-authorize", SLACK_CONNECTOR)
         else:
             log.error("%s    Slack post failed: %s: %s", ICONS["error"], slack_err.__class__.__name__, err_str[:120])
+        return False
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -593,7 +595,8 @@ def main() -> int:
 
         # ── Step 5: Post to Slack ────────────────────────────────────────────────
         log.info("  Step 5: Posting digest to Slack DM")
-        post_digest_to_slack(eng, digest)
+        if not post_digest_to_slack(eng, digest):
+            empty_connector_results.append(f"{eng_name}: Slack delivery failed")
 
     if empty_connector_results:
         log.error("%s  Run finished with empty or failed connector results:", ICONS["error"])

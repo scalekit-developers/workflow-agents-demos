@@ -145,28 +145,7 @@ If any connector returns zero results, or the LLM digest call fails, the run rep
 To run for multiple engineers at once, set `ENGINEERS` in `.env` as a JSON array:
 
 ```bash
-ENGINEERS=[
-  {
-    "id": "eng_alice_123",
-    "name": "Alice",
-    "github_username": "alice",
-    "github_repos": ["acme-corp/api-gateway", "acme-corp/auth-service"],
-    "github_org": "acme-corp",
-    "gitlab_project_path": "acme-corp%2Fpayment-service",
-    "gitlab_user_id": "12345678",
-    "slack_user_id": "U0XXXXXXXXX"
-  },
-  {
-    "id": "eng_bob_456",
-    "name": "Bob",
-    "github_username": "bob",
-    "github_repos": ["acme-corp/frontend"],
-    "github_org": "acme-corp",
-    "gitlab_project_path": "acme-corp%2Ffrontend",
-    "gitlab_user_id": "87654321",
-    "slack_user_id": "U1YYYYYYYYY"
-  }
-]
+ENGINEERS="[{\"id\":\"eng_alice_123\",\"name\":\"Alice\",\"github_username\":\"alice\",\"github_repos\":[\"acme-corp/api-gateway\",\"acme-corp/auth-service\"],\"github_org\":\"acme-corp\",\"gitlab_project_path\":\"acme-corp%2Fpayment-service\",\"gitlab_user_id\":\"12345678\",\"slack_user_id\":\"U0XXXXXXXXX\"},{\"id\":\"eng_bob_456\",\"name\":\"Bob\",\"github_username\":\"bob\",\"github_repos\":[\"acme-corp/frontend\"],\"github_org\":\"acme-corp\",\"gitlab_project_path\":\"acme-corp%2Ffrontend\",\"gitlab_user_id\":\"87654321\",\"slack_user_id\":\"U1YYYYYYYYY\"}]"
 ```
 
 Each engineer's four connectors are authorized independently. When you add a new engineer, the agent prints their four magic links on the first run — they can complete auth from any browser. If set, `ENGINEERS` takes priority over the single-engineer vars below.
@@ -193,36 +172,6 @@ Output is structured, colorized, and timestamped — every line is `HH:MM:SS | L
 
 ---
 
-## Testing
-
-`test_edge_cases.py` covers every unit that can fail silently — no network calls or real credentials required:
-
-- `settings.validate()` fail-fast behavior (missing Scalekit creds, missing `OPENROUTER_API_KEY`, missing engineer config)
-- Engineer config loading (single-engineer env vars, multi-engineer `ENGINEERS` JSON, malformed JSON)
-- Config validation (missing id/name/username/gitlab path/slack id)
-- GitHub PR filtering against live connector response shapes (author vs. assignee match, case-insensitivity, invalid repo paths)
-- GitLab MR + pipeline enrichment (missing project path, no pipeline runs, empty branch)
-- Jira issue normalisation (list vs. dict-shaped API responses)
-- Digest building — confirms there is no rule-based fallback function, and that an LLM failure propagates instead of degrading silently
-- Slack posting (missing user id, expired token, generic failures — all handled without crashing)
-- Logging setup (color formatting, icon presence, noise filtering)
-- `main()` control flow (exit codes on missing/invalid config)
-
-Run it:
-
-```bash
-python test_edge_cases.py
-```
-
-A clean run ends with:
-
-```
-───────────────────────────────────────────────────────
-  ✔  55/55 passed   All clear
-───────────────────────────────────────────────────────
-```
-
-Any real failure prints the exact assertion, expected value, and actual value, and the script exits non-zero — safe to wire into CI.
 
 ---
 
@@ -276,17 +225,7 @@ Any real failure prints the exact assertion, expected value, and actual value, a
 | `Slack post failed` / token expired | Slack OAuth token expired or revoked | Re-authorize the slack connector in the Scalekit dashboard |
 | Run exits with code `2` | One or more connectors returned empty results, or the LLM digest failed for an engineer | Check the listed rows in the error output — investigate that specific connector/engineer |
 
----
 
-## Project structure
-
-```
-run_flow.py           Main pipeline: auth -> GitHub -> GitLab -> Jira -> LLM digest -> Slack
-settings.py            Env var loading and validation (fails fast on missing vars)
-test_edge_cases.py     Edge-case test suite, no network calls required
-.env.example           Template with all required and optional variables
-requirements.txt       Dependencies: scalekit-sdk-python, requests, python-dotenv
-```
 
 ---
 

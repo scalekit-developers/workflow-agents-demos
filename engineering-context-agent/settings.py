@@ -33,18 +33,22 @@ OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL",   "anthropic/claude-3-haiku")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 
+def _trimmed(value: str) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
 def validate() -> None:
     """Fail fast on missing required config instead of degrading silently at runtime."""
     missing = []
-    if not SCALEKIT_ENV_URL:
+    if not _trimmed(SCALEKIT_ENV_URL):
         missing.append("SCALEKIT_ENV_URL")
-    if not SCALEKIT_CLIENT_ID:
+    if not _trimmed(SCALEKIT_CLIENT_ID):
         missing.append("SCALEKIT_CLIENT_ID")
-    if not SCALEKIT_CLIENT_SECRET:
+    if not _trimmed(SCALEKIT_CLIENT_SECRET):
         missing.append("SCALEKIT_CLIENT_SECRET")
-    if not OPENROUTER_API_KEY:
+    if not _trimmed(OPENROUTER_API_KEY):
         missing.append("OPENROUTER_API_KEY")
-    if not ENGINEERS_RAW and not ENGINEER_ID:
+    if not _trimmed(ENGINEERS_RAW) and not _trimmed(ENGINEER_ID):
         missing.append("ENGINEERS (or ENGINEER_ID for single-engineer mode)")
     if missing:
         raise ValueError(
