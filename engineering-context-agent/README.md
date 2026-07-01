@@ -1,18 +1,23 @@
-# Engineering Context Agent
+# Engineering Context Agent (GitHub, GitLab, Jira, Slack)
 
-Fetches each engineer's open PRs from GitHub, MRs and pipeline status from GitLab, and in-progress Jira issues — then posts a personalised daily standup digest to their Slack DM, sent as them, not as a bot.
+> Pull each engineer's open GitHub PRs, GitLab MRs + pipeline status, and in-progress Jira issues, synthesise a standup digest with an LLM, and post it to their own Slack DM. No OAuth token handling in application code. No static or template digests — every run is built from live data.
 
-Built with [Scalekit Agent Auth](https://scalekit.com) — all OAuth across four systems goes through `connect.execute_tool()`. No PATs. No service accounts. No manual token refresh code.
+**Built with [Scalekit Agent Auth](https://scalekit.com).** All OAuth across GitHub, GitLab, Jira, and Slack is managed by Scalekit — per engineer, not a shared service account. The agent never stores or refreshes tokens.
 
-```
-Every morning → GitHub: open PRs authored by or assigned to the engineer
-             → GitLab: open MRs + latest pipeline status per branch
-             → Jira:   in-progress issues (assignee = currentUser())
-             → LLM:    synthesise standup digest
-             → Slack:  post to engineer's DM as them
-```
+---
 
-A companion blog post walks through the architecture end-to-end: [Engineering Standup Agent: GitHub + GitLab + Jira + Slack with Per-Engineer Delegated Identity](./BLOG.md)
+## Overview
+
+The agent runs a single pipeline per configured engineer, on each invocation:
+
+1. Checks that all four connectors (GitHub, GitLab, Jira, Slack) are authorized via Scalekit for that engineer.
+2. Fetches open GitHub PRs authored by or assigned to the engineer, across their repos.
+3. Fetches open GitLab MRs assigned to the engineer, and the latest pipeline status per source branch.
+4. Queries Jira with `assignee = currentUser()` — this resolves to the engineer, not a bot, because the OAuth token is theirs.
+5. Synthesises a standup digest with an LLM (OpenRouter) from that live data. There is no rule-based or template fallback — if the LLM call fails, the run fails loudly for that engineer instead of posting degraded content.
+6. Posts the digest to the engineer's Slack DM via `slack_send_message`, sent as them — not as a bot.
+
+Every field in the digest — PR titles, MR pipeline states, Jira issue keys — comes straight from the connector responses for that run. Nothing is hardcoded or cached between runs.
 
 ---
 
@@ -29,22 +34,40 @@ With Scalekit Agent Auth, each engineer authenticates once per connector. Every 
 
 ---
 
-## Prerequisites
+## Architecture
 
-- [Scalekit account](https://scalekit.com) — free tier works
-- GitHub account with open PRs
-- GitLab account with open MRs
-- Jira (Atlassian Cloud) account with in-progress issues
-- Slack workspace
-- Python 3.11+
+```mermaid
+flowchart TD
+    A([run_flow.py]) --> B[Step 0\nConnector auth check]
+    B --> C[Step 1\ngithub_pull_requests_list]
+    C --> D[Step 2\ngitlab_merge_requests_list\ngitlab_pipelines_list]
+    D --> E[Step 3\njira_issues_search\nassignee = currentUser]
+    E --> F[Step 4\nLLM digest synthesis\nno static fallback]
+    F --> G[Step 5\nslack_send_message]
+
+    B & C & D & E & G --> SK[(Scalekit\nActions API)]
+    SK --> GH([GitHub])
+    SK --> GL([GitLab])
+    SK --> JR([Jira])
+    SK --> SL([Slack])
+
+    F --> OR([OpenRouter LLM\nrequired])
+
+    style SK fill:#6366f1,color:#fff
+    style GH fill:#1a1a1a,color:#fff
+    style GL fill:#fc6d26,color:#fff
+    style JR fill:#0052cc,color:#fff
+    style SL fill:#4a154b,color:#fff
+    style OR fill:#4285f4,color:#fff
+```
 
 ---
 
 ## Setup
 
-### 1. Set up Scalekit connectors
+### 1. Create Scalekit connectors
 
-Go to **app.scalekit.com → Agent Auth → Connections** and create four connectors:
+Go to [app.scalekit.com](https://app.scalekit.com) → Agent Auth → Connections and add:
 
 | Connection name | Service | Required scopes |
 |---|---|---|
@@ -53,11 +76,11 @@ Go to **app.scalekit.com → Agent Auth → Connections** and create four connec
 | `jira` | Jira | `read:jira-work`, `read:jira-user` |
 | `slack` | Slack | `chat:write`, `im:write` |
 
-> Use `read_api` for GitLab — not `api`. This agent only reads data; `read_api` is the correct least-privilege scope for a read-only digest.
+> Use `read_api` for GitLab, not `api` — this agent only reads data; `read_api` is the correct least-privilege scope.
 
-Copy your API credentials from **Settings → API Credentials**.
+Copy your API credentials from Settings → API Credentials.
 
-> **Connector name suffix:** Scalekit may append a random suffix when you create a connector (e.g., `slack-sKfekCVz`). Copy the exact name from the dashboard and set it in `.env`. A mismatch causes `execute_tool()` calls to fail.
+> **Connector name suffix:** Scalekit may append a random suffix when you create a connector (e.g. `slack-sKfekCVz`). Copy the exact name from the dashboard and set it in `.env`. A mismatch causes `execute_tool()` calls to fail.
 
 ### 2. Configure environment
 
@@ -65,51 +88,55 @@ Copy your API credentials from **Settings → API Credentials**.
 cp .env.example .env
 ```
 
-Fill in `.env`:
+Fill in `.env` (see [Environment Variables](#environment-variables) below). The agent fails fast with a clear error listing any missing required variables on startup — it will not run partially configured.
+
+### 3. Install and run
 
 ```bash
-SCALEKIT_ENV_URL=https://your-env.scalekit.dev
-SCALEKIT_CLIENT_ID=skc_xxxxxxxxxxxx
-SCALEKIT_CLIENT_SECRET=your_secret_here
-
-GITHUB_CONNECTOR=github
-GITLAB_CONNECTOR=gitlab
-JIRA_CONNECTOR=jira
-SLACK_CONNECTOR=slack
-
-ENGINEER_ID=eng_alice_123
-ENGINEER_NAME=Alice
-GITHUB_USERNAME=alice
-GITHUB_REPOS=acme-corp/api-gateway,acme-corp/auth-service
-GITHUB_ORG=acme-corp
-GITLAB_PROJECT_PATH=acme-corp%2Fpayment-service   # URL-encode the slash
-GITLAB_USER_ID=12345678                            # GitLab numeric user ID
-SLACK_USER_ID=U0XXXXXXXXX                          # Slack member ID
-```
-
-**Finding your GitLab user ID:** Go to your GitLab profile → Edit profile → scroll to the bottom → User ID.
-
-**Finding your Slack member ID:** Open Slack → click your profile picture → three-dot menu → Copy member ID.
-
-**URL-encoding GitLab project paths:** Replace `/` with `%2F`. `acme-corp/payment-service` becomes `acme-corp%2Fpayment-service`.
-
-### 3. Install dependencies
-
-```bash
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-> **Python version note:** Python 3.11+ is required. If you're on 3.9 or 3.10, some pinned transitive dependencies from `scalekit-sdk-python` may conflict. Use `pyenv` or `conda` to set up a 3.11 environment: `pyenv install 3.11 && pyenv local 3.11`.
-
-### 4. Run
-
-```bash
 python run_flow.py
 ```
 
-The first run checks auth for each connector per engineer. If any are not yet authorized, a magic link is printed — open it, complete the OAuth flow in your browser, press Enter. Every subsequent run goes straight through.
+On the first run, any connector that is not yet authorized will print a magic link. Open it in a browser, complete OAuth, press Enter. Every run after that goes straight through.
 
-`run_flow.py` is the entire pipeline — all five steps in one file.
+---
+
+## What the output looks like
+
+```
+14:23:06 | INFO     | ▶  Engineering Context Agent — 2026-07-01 09:00 UTC
+14:23:06 | INFO     |    Engineers: 1
+14:23:06 | INFO     | ────────────────────────────────────────────────────────
+14:23:06 | INFO     |   Engineer: Alice  (id=eng_alice_123)
+14:23:06 | INFO     |   Step 0: Checking connector auth
+14:23:07 | INFO     | ✔  github (eng_alice_123) — ACTIVE
+14:23:07 | INFO     | ✔  gitlab (eng_alice_123) — ACTIVE
+14:23:08 | INFO     | ✔  jira (eng_alice_123) — ACTIVE
+14:23:08 | INFO     | ✔  slack (eng_alice_123) — ACTIVE
+14:23:08 | INFO     |   Step 1: Fetching GitHub PRs
+14:23:09 | INFO     |     Found 2 open PR(s) across 2 repo(s)
+14:23:09 | INFO     |       #42 Fix auth token refresh bug
+14:23:09 | INFO     |       #45 Add retry logic  ⚠ 5d old
+14:23:09 | INFO     |   Step 2: Fetching GitLab MRs + pipeline status
+14:23:10 | INFO     |     Found 1 open MR(s)
+14:23:10 | INFO     |       !12 Update payment webhook  pipeline: ❌ failed
+14:23:10 | INFO     |   Step 3: Querying Jira (assignee = currentUser())
+14:23:11 | INFO     |     Found 3 in-progress issue(s)
+14:23:11 | INFO     |       ENG-101: Investigate checkout latency  [In Progress]
+14:23:11 | INFO     |   Step 4: Building standup digest
+14:23:13 | INFO     | ✔    LLM digest built from live data
+14:23:13 | INFO     |   ── Digest preview ──
+   • Yesterday: Shipped #42 auth token refresh fix
+   • Today: Working on #45 retry logic, investigating ENG-101
+   • Blockers: !12 payment webhook pipeline failing
+14:23:13 | INFO     |   Step 5: Posting digest to Slack DM
+14:23:14 | INFO     | ✔    Posted to U0XXXXXXXXX (ts=1719835394.001200)
+14:23:14 | INFO     | ✔  Done. Ran for 1 engineer(s).
+```
+
+If any connector returns zero results, or the LLM digest call fails, the run reports it explicitly and exits non-zero — it never substitutes placeholder or template content.
 
 ---
 
@@ -142,18 +169,7 @@ ENGINEERS=[
 ]
 ```
 
-Each engineer's four connectors are authorized independently. When you add a new engineer, the agent prints their four magic links on the first run — they can complete auth from any browser.
-
----
-
-## LLM digest (optional)
-
-If `OPENROUTER_API_KEY` is set in `.env`, the agent uses an LLM to write each engineer's digest. If the key is not set — or the LLM call fails — it falls back to a structured rule-based formatter automatically.
-
-```bash
-OPENROUTER_API_KEY=sk-or-...
-OPENROUTER_MODEL=anthropic/claude-3-haiku   # default
-```
+Each engineer's four connectors are authorized independently. When you add a new engineer, the agent prints their four magic links on the first run — they can complete auth from any browser. If set, `ENGINEERS` takes priority over the single-engineer vars below.
 
 ---
 
@@ -167,66 +183,114 @@ OPENROUTER_MODEL=anthropic/claude-3-haiku   # default
 
 This runs at 9am every weekday. Scalekit refreshes all OAuth tokens before the tool calls fire — the agent never catches a 401.
 
-**Note on timezones:** If your team spans timezones, run the cron at 9am per timezone, or pass the engineer's timezone into the digest prompt.
+**Note on timezones:** if your team spans timezones, run the cron at 9am per timezone, or pass the engineer's timezone into the digest prompt.
 
 ---
 
-## How it works
+## Logging
+
+Output is structured, colorized, and timestamped — every line is `HH:MM:SS | LEVEL | message`, with a status icon (`✔` done, `⚠` warning, `✖` error, `▶` run) so you can scan a run at a glance. Colors auto-disable when output isn't a TTY (e.g. piped to a log file). Set `LOG_LEVEL=DEBUG` in `.env` for more verbose output; defaults to `INFO`.
+
+---
+
+## Testing
+
+`test_edge_cases.py` covers every unit that can fail silently — no network calls or real credentials required:
+
+- `settings.validate()` fail-fast behavior (missing Scalekit creds, missing `OPENROUTER_API_KEY`, missing engineer config)
+- Engineer config loading (single-engineer env vars, multi-engineer `ENGINEERS` JSON, malformed JSON)
+- Config validation (missing id/name/username/gitlab path/slack id)
+- GitHub PR filtering against live connector response shapes (author vs. assignee match, case-insensitivity, invalid repo paths)
+- GitLab MR + pipeline enrichment (missing project path, no pipeline runs, empty branch)
+- Jira issue normalisation (list vs. dict-shaped API responses)
+- Digest building — confirms there is no rule-based fallback function, and that an LLM failure propagates instead of degrading silently
+- Slack posting (missing user id, expired token, generic failures — all handled without crashing)
+- Logging setup (color formatting, icon presence, noise filtering)
+- `main()` control flow (exit codes on missing/invalid config)
+
+Run it:
+
+```bash
+python test_edge_cases.py
+```
+
+A clean run ends with:
 
 ```
-Step 0 — Auth check
-  For each engineer, Scalekit verifies all four connectors are ACTIVE.
-  Prints a magic link for any that need first-time authorization.
-
-Step 1 — GitHub PRs
-  Calls github_pull_requests_list for all open PRs per repo, then filters
-  locally by user.login and assignee.login to get the engineer's own PRs.
-  Loops across all configured repos.
-
-Step 2 — GitLab MRs + pipelines
-  Calls gitlab_merge_requests_list with assignee_id and state=opened.
-  For each open MR, calls gitlab_pipelines_list with ref=source_branch, per_page=1
-  to get the most recent pipeline run status.
-
-Step 3 — Jira
-  Calls jira_issues_search with JQL: assignee = currentUser() AND status IN (...)
-  currentUser() resolves to *this engineer* because the token is theirs.
-  Scalekit resolves the Jira cloud ID automatically — no hardcoded URL construction.
-
-Step 4 — Digest
-  LLM (or rule-based fallback) formats all three data sources into a
-  standup-format digest: yesterday / today / blockers.
-
-Step 5 — Slack
-  Posts digest to the engineer's Slack DM via slack_send_message.
-  Message comes from their own account, not a bot.
+───────────────────────────────────────────────────────
+  ✔  55/55 passed   All clear
+───────────────────────────────────────────────────────
 ```
+
+Any real failure prints the exact assertion, expected value, and actual value, and the script exits non-zero — safe to wire into CI.
+
+---
+
+## Environment Variables
+
+### Required
+
+| Variable | Description |
+|---|---|
+| `SCALEKIT_ENV_URL` | Your Scalekit environment URL, e.g. `https://your-env.scalekit.dev` |
+| `SCALEKIT_CLIENT_ID` | Client ID from Scalekit Settings → API Credentials |
+| `SCALEKIT_CLIENT_SECRET` | Client secret from Scalekit Settings → API Credentials |
+| `OPENROUTER_API_KEY` | OpenRouter API key — required, digests are LLM-only, no fallback formatter |
+| `ENGINEER_ID` (or `ENGINEERS`) | Single-engineer ID, or a JSON array for multi-engineer mode |
+
+### Single-engineer mode (used when `ENGINEERS` is not set)
+
+| Variable | Description |
+|---|---|
+| `ENGINEER_NAME` | Display name used in the digest |
+| `GITHUB_USERNAME` | GitHub login used to filter authored/assigned PRs |
+| `GITHUB_REPOS` | Comma-separated `owner/repo` list to check for open PRs |
+| `GITHUB_ORG` | Used to auto-discover repos when `GITHUB_REPOS` is empty |
+| `GITLAB_PROJECT_PATH` | URL-encoded GitLab project path, e.g. `acme-corp%2Fpayment-service` |
+| `GITLAB_USER_ID` | GitLab numeric user ID (Profile → Edit profile → User ID) |
+| `SLACK_USER_ID` | Slack member ID (profile → three-dot menu → Copy member ID) |
+
+### Optional
+
+| Variable | Default | Description |
+|---|---|---|
+| `GITHUB_CONNECTOR` | `github` | Scalekit connection name for GitHub |
+| `GITLAB_CONNECTOR` | `gitlab` | Scalekit connection name for GitLab |
+| `JIRA_CONNECTOR` | `jira` | Scalekit connection name for Jira |
+| `SLACK_CONNECTOR` | `slack` | Scalekit connection name for Slack |
+| `OPENROUTER_MODEL` | `anthropic/claude-3-haiku` | OpenRouter model used to write the digest |
+| `LOG_LEVEL` | `INFO` | Log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+
+---
+
+## Troubleshooting
+
+| Error | Cause | Fix |
+|---|---|---|
+| `ValueError: Missing required env vars` | One or more required vars not set in `.env` | Copy `.env.example` to `.env` and fill all values, including `OPENROUTER_API_KEY` |
+| Connector prints a magic link on startup | Account not yet authorized in Scalekit | Open the link in a browser, complete OAuth, press Enter |
+| `execute_tool()` fails with a connector error | Connector name in `.env` doesn't match the dashboard | Check the exact connector name (including any random suffix) in app.scalekit.com |
+| Jira returns no issues | `currentUser()` resolves to the token owner only | Confirm the engineer's Jira account has in-progress issues assigned to them, and that the connector is fully authorized |
+| GitLab pipeline status is `unknown` | No CI/CD configured, or the MR predates the first pipeline run | Expected — not an error |
+| `LLM digest failed: ... — no fallback, skipping this engineer` | `OPENROUTER_API_KEY` invalid, rate-limited, or OpenRouter is down | Check the key and OpenRouter status; there is intentionally no template fallback, so the digest is skipped for that engineer until the LLM call succeeds |
+| `Slack post failed` / token expired | Slack OAuth token expired or revoked | Re-authorize the slack connector in the Scalekit dashboard |
+| Run exits with code `2` | One or more connectors returned empty results, or the LLM digest failed for an engineer | Check the listed rows in the error output — investigate that specific connector/engineer |
 
 ---
 
 ## Project structure
 
 ```
-├── run_flow.py        # main pipeline — all five steps in one file
-├── BLOG.md            # companion blog post
-├── .env.example       # environment template
-├── requirements.txt
-├── .gitignore
-└── README.md
+run_flow.py           Main pipeline: auth -> GitHub -> GitLab -> Jira -> LLM digest -> Slack
+settings.py            Env var loading and validation (fails fast on missing vars)
+test_edge_cases.py     Edge-case test suite, no network calls required
+.env.example           Template with all required and optional variables
+requirements.txt       Dependencies: scalekit-sdk-python, requests, python-dotenv
 ```
 
 ---
 
-## Common issues
+## SDK Versions
 
-**`execute_tool()` fails with a connector error**
-Check that the connector name in `.env` matches exactly what's in the Scalekit dashboard (including any random suffix).
-
-**Jira returns no issues**
-Confirm the engineer's Jira account has in-progress issues assigned to them. The `currentUser()` JQL function only returns issues assigned to the token owner — if the token isn't fully authorized, it may return 0 results silently.
-
-**GitLab pipeline status is `unknown`**
-The project may not have CI/CD configured, or the MR has no recent pipeline run. This is expected for MRs created before a pipeline was attached.
-
-**Python version errors**
-Use Python 3.11+. `scalekit-sdk-python` uses type annotations (`str | None`, `list[dict]`) that require 3.10 at minimum, and some transitive dependencies require 3.11.
+- `scalekit-sdk-python >= 2.12.0`
+- Last verified: 2026-07-01

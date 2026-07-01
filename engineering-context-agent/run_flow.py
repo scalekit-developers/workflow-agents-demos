@@ -2,11 +2,12 @@
 Engineering Context Agent: GitHub PRs + GitLab Pipeline Status + Jira Issues → Slack DM
 
 For each engineer, the agent:
-  1. Fetches their open GitHub PRs (authored or assigned)
+  1. Fetches their open GitHub PRs (authored or assigned) — live data via Scalekit
   2. Fetches their open GitLab MRs and the latest pipeline status per active branch
   3. Queries Jira with JQL using assignee = currentUser() — works because each
      tool call carries that engineer's own Atlassian OAuth token, not a service account
-  4. Synthesises a structured standup digest with an LLM (or rule-based fallback)
+  4. Synthesises a structured standup digest with an LLM from that live data —
+     no static/template fallback, the run fails loudly if the LLM call fails
   5. Posts the digest to the engineer's Slack DM as them, not as a bot
 
 Scalekit Agent Auth handles OAuth for all four connectors per engineer —
@@ -19,69 +20,134 @@ Setup:
   python run_flow.py          # run for all configured engineers
 """
 
-import os
 import json
+import logging
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
-from dotenv import load_dotenv
 import scalekit.client
 
-load_dotenv()
+import settings
+
+settings.validate()
+
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+ICONS = {
+    "done":  "✔",  # ✔
+    "warn":  "⚠",  # ⚠
+    "error": "✖",  # ✖
+    "info":  "ℹ",  # ℹ
+    "run":   "▶",  # ▶
+}
+
+
+class _ColorFormatter(logging.Formatter):
+    """Adds ANSI color per level and a timestamp | LEVEL | message shape."""
+
+    COLORS = {
+        logging.DEBUG:    "\033[90m",   # gray
+        logging.INFO:     "\033[0m",    # default
+        logging.WARNING:  "\033[93m",   # yellow
+        logging.ERROR:    "\033[91m",   # red
+        logging.CRITICAL: "\033[95m",   # magenta
+    }
+    RESET = "\033[0m"
+
+    def __init__(self, colorize: bool = True):
+        super().__init__(
+            fmt="%(asctime)s | %(levelname)-8s | %(message)s",
+            datefmt="%H:%M:%S",
+        )
+        self.colorize = colorize
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = super().format(record)
+        if not self.colorize:
+            return message
+        color = self.COLORS.get(record.levelno, "")
+        return f"{color}{message}{self.RESET}" if color else message
+
+
+class _NoiseFilter(logging.Filter):
+    """Drops noisy third-party log lines we never want to see (e.g. gRPC AFC chatter)."""
+
+    BLOCKED_SUBSTRINGS = ("AFC is enabled",)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not any(s in message for s in self.BLOCKED_SUBSTRINGS)
+
+
+def _setup_logging() -> logging.Logger:
+    level = getattr(logging, settings.LOG_LEVEL.strip().upper(), logging.INFO)
+
+    logger = logging.getLogger("engineering-context-agent")
+    logger.setLevel(level)
+    logger.propagate = False
+
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        colorize = sys.stdout.isatty()
+        handler.setFormatter(_ColorFormatter(colorize=colorize))
+        handler.addFilter(_NoiseFilter())
+        logger.addHandler(handler)
+
+    return logger
+
+
+log = _setup_logging()
+
 
 # ── Scalekit client ───────────────────────────────────────────────────────────
 sk = scalekit.client.ScalekitClient(
-    client_id=os.environ["SCALEKIT_CLIENT_ID"],
-    client_secret=os.environ["SCALEKIT_CLIENT_SECRET"],
-    env_url=os.environ["SCALEKIT_ENV_URL"],
+    client_id=settings.SCALEKIT_CLIENT_ID,
+    client_secret=settings.SCALEKIT_CLIENT_SECRET,
+    env_url=settings.SCALEKIT_ENV_URL,
 )
 connect = sk.connect
 
-GITHUB_CONNECTOR = os.environ.get("GITHUB_CONNECTOR", "github")
-GITLAB_CONNECTOR = os.environ.get("GITLAB_CONNECTOR", "gitlab")
-JIRA_CONNECTOR   = os.environ.get("JIRA_CONNECTOR",   "jira")
-SLACK_CONNECTOR  = os.environ.get("SLACK_CONNECTOR",  "slack")
+GITHUB_CONNECTOR = settings.GITHUB_CONNECTOR
+GITLAB_CONNECTOR = settings.GITLAB_CONNECTOR
+JIRA_CONNECTOR   = settings.JIRA_CONNECTOR
+SLACK_CONNECTOR  = settings.SLACK_CONNECTOR
 
 ALL_CONNECTORS = [GITHUB_CONNECTOR, GITLAB_CONNECTOR, JIRA_CONNECTOR, SLACK_CONNECTOR]
-REQUIRE_NON_EMPTY_CONNECTOR_DATA = os.environ.get(
-    "REQUIRE_NON_EMPTY_CONNECTOR_DATA", "true"
-).strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ── Engineer config ────────────────────────────────────────────────────────────
 def _load_engineers() -> list[dict]:
-    raw = os.environ.get("ENGINEERS", "").strip()
+    raw = settings.ENGINEERS_RAW.strip()
     if raw:
         try:
             parsed = json.loads(raw)
             if not isinstance(parsed, list):
-                print("⚠️  ENGINEERS must be a JSON array of engineer objects")
+                log.warning("%s  ENGINEERS must be a JSON array of engineer objects", ICONS["warn"])
                 return []
             return parsed
         except json.JSONDecodeError as e:
-            print(f"⚠️  Could not parse ENGINEERS JSON: {e}")
+            log.warning("%s  Could not parse ENGINEERS JSON: %s", ICONS["warn"], e)
             return []
 
     # Single-engineer mode from individual env vars
     # No hardcoded demo defaults: values must come from env.
-    engineer_id = os.environ.get("ENGINEER_ID", "").strip()
+    engineer_id = settings.ENGINEER_ID.strip()
     if not engineer_id:
         return []
 
     eng = {
         "id":                  engineer_id,
-        "name":                os.environ.get("ENGINEER_NAME", "").strip(),
-        "github_username":     os.environ.get("GITHUB_USERNAME", "").strip(),
+        "name":                settings.ENGINEER_NAME.strip(),
+        "github_username":     settings.GITHUB_USERNAME.strip(),
         "github_repos":        [
             r.strip()
-            for r in os.environ.get("GITHUB_REPOS", "").split(",")
+            for r in settings.GITHUB_REPOS.split(",")
             if r.strip()
         ],
-        "github_org":          os.environ.get("GITHUB_ORG", "").strip(),
-        "gitlab_project_path": os.environ.get("GITLAB_PROJECT_PATH", "").strip(),
-        "gitlab_user_id":      os.environ.get("GITLAB_USER_ID", "").strip(),
-        "slack_user_id":       os.environ.get("SLACK_USER_ID", "").strip(),
+        "github_org":          settings.GITHUB_ORG.strip(),
+        "gitlab_project_path": settings.GITLAB_PROJECT_PATH.strip(),
+        "gitlab_user_id":      settings.GITLAB_USER_ID.strip(),
+        "slack_user_id":       settings.SLACK_USER_ID.strip(),
     }
     return [eng]
 
@@ -127,10 +193,10 @@ def ensure_authorized(connector: str, identifier: str) -> None:
         link = connect.get_authorization_link(
             connection_name=connector, identifier=identifier
         ).link
-        print(f"\n  [{connector}] Not authorized for {identifier}. Open:\n    {link}\n")
+        log.warning("%s  [%s] Not authorized for %s. Open:\n    %s\n", ICONS["warn"], connector, identifier, link)
         input("  Press Enter after authorizing in the browser...")
     else:
-        print(f"  ✓ {connector} ({identifier}) — ACTIVE")
+        log.info("%s  %s (%s) — ACTIVE", ICONS["done"], connector, identifier)
 
 
 # ── Tool execution ─────────────────────────────────────────────────────────────
@@ -178,7 +244,7 @@ def fetch_github_prs(eng: dict) -> list[dict]:
         try:
             owner, repo = repo_path.split("/", 1)
         except ValueError:
-            print(f"    ⚠️  Skipping invalid repo path: {repo_path}")
+            log.warning("%s    Skipping invalid repo path: %s", ICONS["warn"], repo_path)
             continue
 
         raw = tool(
@@ -362,9 +428,9 @@ Jira Issues In Progress:
 
     resp = http.post(
         "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"},
+        headers={"Authorization": f"Bearer {settings.OPENROUTER_API_KEY}"},
         json={
-            "model": os.environ.get("OPENROUTER_MODEL", "anthropic/claude-3-haiku"),
+            "model": settings.OPENROUTER_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
         },
@@ -390,88 +456,17 @@ def _pipeline_icon(status: str) -> str:
     )
 
 
-def _build_digest_rule_based(eng: dict, prs: list, mrs: list, issues: list) -> str:
-    """
-    Format the standup digest without an LLM.
-    Falls back here when OPENROUTER_API_KEY is not set or the LLM call fails.
-    """
-    lines = [f"*{eng['name']}'s Daily Standup — {datetime.now(timezone.utc).strftime('%a %d %b')}*\n"]
-
-    # PRs
-    if prs:
-        lines.append("*GitHub PRs*")
-        for pr in prs:
-            age   = _days_open(pr.get("created_at"))
-            label = pr.get("title", "")[:60]
-            repo  = pr.get("_repo", "")
-            flags = []
-            if pr.get("draft"):
-                flags.append("draft")
-            if age > 3:
-                flags.append(f"{age}d open")
-            flag_str = f"  ⚠️ {', '.join(flags)}" if flags else ""
-            url  = pr.get("html_url") or pr.get("url") or ""
-            iid  = pr.get("number") or pr.get("iid") or ""
-            lines.append(f"  • <{url}|#{iid}> {label} `{repo}`{flag_str}")
-    else:
-        lines.append("*GitHub PRs*\n  No open PRs")
-
-    lines.append("")
-
-    # MRs
-    if mrs:
-        lines.append("*GitLab MRs*")
-        for mr in mrs:
-            age    = _days_open(mr.get("created_at"))
-            label  = mr.get("title", "")[:60]
-            branch = mr.get("source_branch", "")
-            status = mr.get("pipeline_status", "unknown")
-            icon   = _pipeline_icon(status)
-            url    = mr.get("web_url") or mr.get("url") or ""
-            iid    = mr.get("iid") or ""
-            flags  = []
-            if age > 3:
-                flags.append(f"{age}d open")
-            flag_str = f"  ⚠️ {', '.join(flags)}" if flags else ""
-            lines.append(f"  • <{url}|!{iid}> {label}  {icon} `{branch}`{flag_str}")
-    else:
-        lines.append("*GitLab MRs*\n  No open MRs")
-
-    lines.append("")
-
-    # Jira
-    if issues:
-        lines.append("*Jira In Progress*")
-        for issue in issues:
-            fields   = issue.get("fields") or {}
-            key      = issue.get("key", "")
-            summary  = fields.get("summary") or issue.get("summary", "")
-            status   = (fields.get("status") or {}).get("name") or fields.get("status", "")
-            priority = (fields.get("priority") or {}).get("name") or ""
-            p_flag   = " 🔴" if priority and "highest" in priority.lower() else ""
-            lines.append(f"  • *{key}* {summary[:60]}  [{status}]{p_flag}")
-    else:
-        lines.append("*Jira In Progress*\n  No in-progress issues")
-
-    lines.append("")
-    lines.append("_Via Engineering Context Agent · Scalekit Agent Auth_")
-    return "\n".join(lines)
-
-
 def build_digest(eng: dict, prs: list, mrs: list, issues: list) -> str:
-    # Skip LLM entirely if there's no real data — prevents hallucinated content
-    if not prs and not mrs and not issues:
-        print("    (no data — skipping LLM, using rule-based)")
-        return _build_digest_rule_based(eng, prs, mrs, issues)
+    """
+    Synthesise the standup digest from live PR/MR/Jira data with the LLM.
 
-    if os.environ.get("OPENROUTER_API_KEY"):
-        try:
-            result = _build_digest_with_llm(eng, prs, mrs, issues)
-            print("    (LLM digest ✓)")
-            return result
-        except Exception as e:
-            print(f"    ⚠️  LLM failed ({e.__class__.__name__}: {e}) — using rule-based formatter")
-    return _build_digest_rule_based(eng, prs, mrs, issues)
+    No static template or rule-based fallback: if the LLM call fails, the
+    exception propagates so the run fails loudly instead of posting
+    degraded, non-LLM-formatted content.
+    """
+    result = _build_digest_with_llm(eng, prs, mrs, issues)
+    log.info("%s    LLM digest built from live data", ICONS["done"])
+    return result
 
 
 # ── Step 5: Post to Slack ──────────────────────────────────────────────────────
@@ -487,7 +482,7 @@ def post_digest_to_slack(eng: dict, digest: str) -> None:
     slack_user_id = eng.get("slack_user_id", "")
 
     if not slack_user_id:
-        print(f"    ⚠️  No slack_user_id configured for {eng['name']} — skipping Slack post")
+        log.warning("%s    No slack_user_id configured for %s — skipping Slack post", ICONS["warn"], eng["name"])
         return
 
     try:
@@ -498,107 +493,117 @@ def post_digest_to_slack(eng: dict, digest: str) -> None:
             connection_name=SLACK_CONNECTOR,
         )
         ts = (result.data or {}).get("timestamp") or (result.data or {}).get("ts") or ""
-        print(f"    ✓ Posted to {slack_user_id} (ts={ts})")
+        log.info("%s    Posted to %s (ts=%s)", ICONS["done"], slack_user_id, ts)
     except Exception as slack_err:
         err_str = str(slack_err)
         if "token_expired" in err_str or "INVALID_ARGUMENT" in err_str:
-            print(f"    ⚠️  Slack token expired — re-authorize:")
+            log.warning("%s    Slack token expired — re-authorize:", ICONS["warn"])
             try:
                 link = connect.get_authorization_link(
                     connection_name=SLACK_CONNECTOR, identifier=identifier
                 ).link
-                print(f"    {link}")
+                log.warning("    %s", link)
             except Exception:
-                print(f"    Go to app.scalekit.com → Agent Auth → Connections → {SLACK_CONNECTOR} → re-authorize")
+                log.warning("    Go to app.scalekit.com → Agent Auth → Connections → %s → re-authorize", SLACK_CONNECTOR)
         else:
-            print(f"    ✗ Slack post failed: {slack_err.__class__.__name__}: {err_str[:120]}")
+            log.error("%s    Slack post failed: %s: %s", ICONS["error"], slack_err.__class__.__name__, err_str[:120])
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
-if not ENGINEERS:
-    print("No engineers configured. Set ENGINEERS JSON or ENGINEER_* vars in .env")
-    sys.exit(1)
+def main() -> int:
+    if not ENGINEERS:
+        log.error("%s  No engineers configured. Set ENGINEERS JSON or ENGINEER_* vars in .env", ICONS["error"])
+        return 1
 
-config_errors: list[str] = []
-for idx, eng in enumerate(ENGINEERS, start=1):
-    for err in validate_engineer_config(eng):
-        config_errors.append(f"engineer[{idx}] ({eng.get('id', '?')}): {err}")
+    config_errors: list[str] = []
+    for idx, eng in enumerate(ENGINEERS, start=1):
+        for err in validate_engineer_config(eng):
+            config_errors.append(f"engineer[{idx}] ({eng.get('id', '?')}): {err}")
 
-if config_errors:
-    print("\nConfiguration errors detected:")
-    for err in config_errors:
-        print(f"  - {err}")
-    sys.exit(1)
+    if config_errors:
+        log.error("%s  Configuration errors detected:", ICONS["error"])
+        for err in config_errors:
+            log.error("  - %s", err)
+        return 1
 
-today_label = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-print(f"\n── Engineering Context Agent — {today_label} ──")
-print(f"   Engineers: {len(ENGINEERS)}")
+    today_label = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    log.info("%s  Engineering Context Agent — %s", ICONS["run"], today_label)
+    log.info("   Engineers: %d", len(ENGINEERS))
 
-empty_connector_results: list[str] = []
+    empty_connector_results: list[str] = []
 
-for eng in ENGINEERS:
-    eng_name = eng.get("name", eng.get("id", "?"))
-    eng_id   = eng["id"]
-    print(f"\n{'─'*60}")
-    print(f"  Engineer: {eng_name}  (id={eng_id})")
+    for eng in ENGINEERS:
+        eng_name = eng.get("name", eng.get("id", "?"))
+        eng_id   = eng["id"]
+        log.info("%s", "─" * 60)
+        log.info("  Engineer: %s  (id=%s)", eng_name, eng_id)
 
-    # ── Step 0: Auth check ─────────────────────────────────────────────────────
-    print("\n  Step 0: Checking connector auth")
-    for connector in ALL_CONNECTORS:
-        ensure_authorized(connector, eng_id)
+        # ── Step 0: Auth check ───────────────────────────────────────────────────
+        log.info("  Step 0: Checking connector auth")
+        for connector in ALL_CONNECTORS:
+            ensure_authorized(connector, eng_id)
 
-    # ── Step 1: GitHub PRs ─────────────────────────────────────────────────────
-    print("\n  Step 1: Fetching GitHub PRs")
-    repos = eng.get("github_repos") or []
-    github_prs = fetch_github_prs(eng)
-    print(f"    Found {len(github_prs)} open PR(s) across {len(repos)} repo(s)")
-    for pr in github_prs:
-        age = _days_open(pr.get("created_at"))
-        stale_flag = f"  ⚠️ {age}d old" if age > 3 else ""
-        print(f"      #{pr.get('number') or pr.get('iid')} {pr.get('title','')[:55]}{stale_flag}")
-    if not github_prs:
-        empty_connector_results.append(f"{eng_name}: GitHub returned 0 open PRs")
+        # ── Step 1: GitHub PRs ───────────────────────────────────────────────────
+        log.info("  Step 1: Fetching GitHub PRs")
+        repos = eng.get("github_repos") or []
+        github_prs = fetch_github_prs(eng)
+        log.info("    Found %d open PR(s) across %d repo(s)", len(github_prs), len(repos))
+        for pr in github_prs:
+            age = _days_open(pr.get("created_at"))
+            stale_flag = f"  {ICONS['warn']} {age}d old" if age > 3 else ""
+            log.info("      #%s %s%s", pr.get("number") or pr.get("iid"), pr.get("title", "")[:55], stale_flag)
+        if not github_prs:
+            empty_connector_results.append(f"{eng_name}: GitHub returned 0 open PRs")
 
-    # ── Step 2: GitLab MRs + pipelines ────────────────────────────────────────
-    print("\n  Step 2: Fetching GitLab MRs + pipeline status")
-    gitlab_mrs = fetch_gitlab_mrs_and_pipelines(eng)
-    print(f"    Found {len(gitlab_mrs)} open MR(s)")
-    for mr in gitlab_mrs:
-        icon = _pipeline_icon(mr.get("pipeline_status", ""))
-        print(
-            f"      !{mr.get('iid')} {mr.get('title','')[:50]}  "
-            f"pipeline: {icon} {mr.get('pipeline_status','unknown')}"
-        )
-    if not gitlab_mrs:
-        empty_connector_results.append(f"{eng_name}: GitLab returned 0 open MRs")
+        # ── Step 2: GitLab MRs + pipelines ──────────────────────────────────────
+        log.info("  Step 2: Fetching GitLab MRs + pipeline status")
+        gitlab_mrs = fetch_gitlab_mrs_and_pipelines(eng)
+        log.info("    Found %d open MR(s)", len(gitlab_mrs))
+        for mr in gitlab_mrs:
+            icon = _pipeline_icon(mr.get("pipeline_status", ""))
+            log.info(
+                "      !%s %s  pipeline: %s %s",
+                mr.get("iid"), mr.get("title", "")[:50], icon, mr.get("pipeline_status", "unknown"),
+            )
+        if not gitlab_mrs:
+            empty_connector_results.append(f"{eng_name}: GitLab returned 0 open MRs")
 
-    # ── Step 3: Jira issues ────────────────────────────────────────────────────
-    print("\n  Step 3: Querying Jira (assignee = currentUser())")
-    jira_issues = fetch_jira_issues(eng)
-    print(f"    Found {len(jira_issues)} in-progress issue(s)")
-    for issue in jira_issues:
-        fields  = issue.get("fields") or {}
-        key     = issue.get("key", "")
-        summary = fields.get("summary") or issue.get("summary", "")
-        status  = (fields.get("status") or {}).get("name") or ""
-        print(f"      {key}: {summary[:55]}  [{status}]")
-    if not jira_issues:
-        empty_connector_results.append(f"{eng_name}: Jira returned 0 in-progress issues")
+        # ── Step 3: Jira issues ──────────────────────────────────────────────────
+        log.info("  Step 3: Querying Jira (assignee = currentUser())")
+        jira_issues = fetch_jira_issues(eng)
+        log.info("    Found %d in-progress issue(s)", len(jira_issues))
+        for issue in jira_issues:
+            fields  = issue.get("fields") or {}
+            key     = issue.get("key", "")
+            summary = fields.get("summary") or issue.get("summary", "")
+            status  = (fields.get("status") or {}).get("name") or ""
+            log.info("      %s: %s  [%s]", key, summary[:55], status)
+        if not jira_issues:
+            empty_connector_results.append(f"{eng_name}: Jira returned 0 in-progress issues")
 
-    # ── Step 4: Build digest ───────────────────────────────────────────────────
-    print("\n  Step 4: Building standup digest")
-    digest = build_digest(eng, github_prs, gitlab_mrs, jira_issues)
-    print(f"\n  ── Digest preview ──\n{digest}\n  ────────────────────")
+        # ── Step 4: Build digest ─────────────────────────────────────────────────
+        log.info("  Step 4: Building standup digest")
+        try:
+            digest = build_digest(eng, github_prs, gitlab_mrs, jira_issues)
+        except Exception as e:
+            log.error("%s    LLM digest failed: %s: %s — no fallback, skipping this engineer", ICONS["error"], e.__class__.__name__, e)
+            empty_connector_results.append(f"{eng_name}: LLM digest generation failed")
+            continue
+        log.info("  ── Digest preview ──\n%s\n  ────────────────────", digest)
 
-    # ── Step 5: Post to Slack ──────────────────────────────────────────────────
-    print("\n  Step 5: Posting digest to Slack DM")
-    post_digest_to_slack(eng, digest)
+        # ── Step 5: Post to Slack ────────────────────────────────────────────────
+        log.info("  Step 5: Posting digest to Slack DM")
+        post_digest_to_slack(eng, digest)
 
-if REQUIRE_NON_EMPTY_CONNECTOR_DATA and empty_connector_results:
-    print("\n✗ Connector data check failed (empty results):")
-    for row in empty_connector_results:
-        print(f"  - {row}")
-    print("Set REQUIRE_NON_EMPTY_CONNECTOR_DATA=false to allow empty connector results.")
-    sys.exit(2)
+    if empty_connector_results:
+        log.error("%s  Run finished with empty or failed connector results:", ICONS["error"])
+        for row in empty_connector_results:
+            log.error("  - %s", row)
+        return 2
 
-print(f"\n✓ Done. Ran for {len(ENGINEERS)} engineer(s).\n")
+    log.info("%s  Done. Ran for %d engineer(s).", ICONS["done"], len(ENGINEERS))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
