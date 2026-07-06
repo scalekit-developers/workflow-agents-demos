@@ -1,46 +1,55 @@
-"""
-Gmail connector — creates email drafts via the Gmail REST API v1.
-Token is fetched from Scalekit (connector: gmail).
-"""
-import base64
-import requests
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+"""Gmail connector — creates email drafts via Scalekit gmail_create_draft tool."""
+import logging
+from typing import Any, Optional
 
-GMAIL_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
+logger = logging.getLogger("granola-hubspot")
 
 
-def _build_raw_message(to: str, subject: str, body: str, reply_to: str | None = None) -> str:
-    msg = MIMEMultipart("alternative")
-    msg["to"] = to
-    msg["subject"] = subject
-    if reply_to:
-        msg["Reply-To"] = reply_to
-    msg.attach(MIMEText(body, "plain"))
-    return base64.urlsafe_b64encode(msg.as_bytes()).decode()
+def create_draft(
+    connect: Any,
+    user_id: str,
+    to: str,
+    subject: str,
+    body: str,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None,
+    content_type: str = "text/plain",
+) -> Optional[dict]:
+    """Create a Gmail draft using Scalekit gmail_create_draft tool.
 
+    Args:
+        connect: Scalekit connect client
+        user_id: User identifier (email)
+        to: Recipient email address
+        subject: Email subject
+        body: Email body (plain text or HTML)
+        cc: Optional CC recipient
+        bcc: Optional BCC recipient
+        content_type: "text/plain" or "text/html" (default: "text/plain")
 
-def create_draft(access_token: str, to: str, subject: str, body: str) -> dict:
-    """Create a Gmail draft (not sent — stays in Drafts folder).
-
-    Returns the created draft object including its id.
+    Returns the created draft object including its id, or None on failure.
     """
-    raw = _build_raw_message(to, subject, body)
-    response = requests.post(
-        f"{GMAIL_BASE}/drafts",
-        headers={"Authorization": f"Bearer {access_token}"},
-        json={"message": {"raw": raw}},
-    )
-    response.raise_for_status()
-    return response.json()
+    try:
+        tool_input = {
+            "to": to,
+            "subject": subject,
+            "body": body,
+            "content_type": content_type,
+        }
+        if cc:
+            tool_input["cc"] = cc
+        if bcc:
+            tool_input["bcc"] = bcc
 
-
-def list_drafts(access_token: str, max_results: int = 5) -> list[dict]:
-    """List existing drafts (id + snippet)."""
-    response = requests.get(
-        f"{GMAIL_BASE}/drafts",
-        headers={"Authorization": f"Bearer {access_token}"},
-        params={"maxResults": max_results},
-    )
-    response.raise_for_status()
-    return response.json().get("drafts", [])
+        result = connect.execute_tool(
+            tool_name="gmail_create_draft",
+            identifier=user_id,
+            tool_input=tool_input,
+        )
+        draft_id = (result.data or {}).get("message", {}).get("id")
+        if draft_id:
+            logger.debug(f"Draft created for {to} (id={draft_id})")
+        return result.data or {}
+    except Exception as e:
+        logger.error(f"Failed to create Gmail draft: {e}")
+        return None
