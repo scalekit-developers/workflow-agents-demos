@@ -31,50 +31,101 @@ Each step logs clearly with status indicators so you see what is happening.
 
 ## Architecture
 
+### Complete Pipeline Flow
+
 ```mermaid
 graph TD
-    Start([User Triggers Agent]) --> Auth["Step 0: Auth Check<br/>Verify 4 Scalekit Connectors<br/>granolamcp, hubspot, gmail, slack"]
+    Start([START<br/>User Runs Agent]) 
     
-    Auth -->|All Active| Fetch["Step 1: Fetch Meetings<br/>granolamcp_list_meetings<br/>Get recent calls"]
-    Auth -->|Not Authorized| Link["Print Magic Link<br/>Wait for User OAuth"]
-    Link --> Auth
+    Start --> Step0["STEP 0<br/>Auth Check<br/>---<br/>Verify 4 Connectors:<br/>granolamcp, hubspot<br/>gmail, slack"]
     
-    Fetch --> FetchDetail["granolamcp_get_meeting_transcript<br/>Extract transcript for each meeting"]
-    FetchDetail --> Extract["Step 2: Extract Meeting Info<br/>OpenRouter Claude LLM<br/>Parse company, stage, amount, actions"]
+    Step0 -->|All ACTIVE| Step1["STEP 1<br/>Fetch Meetings<br/>---<br/>granolamcp_list_meetings<br/>granolamcp_get_meeting_transcript"]
     
-    Extract -->|LLM Success| ExtractData["Extracted Data:<br/>company: TechFlow Inc<br/>amount: $350000<br/>stage: presentationscheduled<br/>actions: 5 items"]
-    Extract -->|LLM Fails| Fallback["Fallback to Regex Parser<br/>Rule-based extraction"]
-    Fallback --> ExtractData
+    Step0 -->|NOT Auth| AuthLink["Print Magic Link<br/>User Authorizes<br/>Then Loop Back"]
+    AuthLink --> Step0
     
-    ExtractData --> HubSearch["Step 2b: Search HubSpot<br/>hubspot_deals_search<br/>Find existing deal by company"]
+    Step1 -->|No Meetings| Exit2([EXIT CODE 2<br/>No Meetings Found])
     
-    HubSearch -->|Deal Found| HubUpdate["hubspot_deal_update<br/>Update with meeting notes<br/>Update deal stage"]
-    HubSearch -->|No Deal| HubCreate["hubspot_deal_create<br/>Create new deal<br/>Set stage and amount"]
+    Step1 -->|Meetings Found| Step2a["STEP 2A<br/>Extract Meeting Info<br/>---<br/>OpenRouter Claude LLM<br/>Parse: company, stage<br/>amount, actions"]
     
-    HubUpdate --> DealDone["Deal #334635794142<br/>Created/Updated"]
-    HubCreate --> DealDone
+    Step2a -->|LLM Success| ExtractOK["Extracted:<br/>Company: TechFlow Inc<br/>Amount: $350000<br/>Stage: presentationscheduled<br/>Actions: 5 items"]
+    Step2a -->|LLM Fails| Fallback["Fallback to Regex<br/>Rule-based Parser"]
+    Fallback --> ExtractOK
     
-    DealDone --> Gmail["Step 3: Create Gmail Draft<br/>gmail_create_draft<br/>Scalekit native tool"]
-    Gmail --> GmailDone["Draft #19f362ef97e24442<br/>In user Drafts folder<br/>Ready for review"]
+    ExtractOK --> Step2b["STEP 2B<br/>Search HubSpot Deal<br/>---<br/>hubspot_deals_search<br/>Find by company name"]
     
-    GmailDone --> Slack["Step 4: Post to Slack<br/>slack_send_message<br/>Format summary + actions"]
+    Step2b -->|Found| HubUpdate["HubSpot Update<br/>hubspot_deal_update<br/>Add meeting notes"]
+    Step2b -->|Not Found| HubCreate["HubSpot Create<br/>hubspot_deal_create<br/>New deal with stage amount"]
     
-    Slack --> SlackDone["Slack Message Posted<br/>ts=1783320476.336339<br/>Notification sent"]
+    HubUpdate --> DealOK["RESULT<br/>Deal #334635794142<br/>Ready for next steps"]
+    HubCreate --> DealOK
     
-    SlackDone --> End([Pipeline Complete<br/>Exit Code 0])
+    DealOK --> Step3["STEP 3<br/>Create Gmail Draft<br/>---<br/>gmail_create_draft<br/>Scalekit native tool<br/>Subject + body generated"]
     
-    Extract -->|No Meetings| Exit2([No Meetings Found<br/>Exit Code 2])
+    Step3 --> GmailOK["RESULT<br/>Draft #19f362ef97e24442<br/>In user Drafts folder<br/>Ready for review"]
     
-    style Auth fill:#e1f5ff
-    style Fetch fill:#e1f5ff
-    style Extract fill:#fff3e0
-    style HubSearch fill:#f3e5f5
-    style HubUpdate fill:#f3e5f5
-    style HubCreate fill:#f3e5f5
-    style Gmail fill:#e8f5e9
-    style Slack fill:#fce4ec
-    style End fill:#c8e6c9
+    GmailOK --> Step4["STEP 4<br/>Post to Slack<br/>---<br/>slack_send_message<br/>Format + send summary"]
+    
+    Step4 --> SlackOK["RESULT<br/>Slack ts=1783320476.336339<br/>Team notified<br/>Summary posted"]
+    
+    SlackOK --> Success([EXIT CODE 0<br/>COMPLETE<br/>All steps finished])
+    
+    style Step0 fill:#1e3a8a,color:#fff,stroke:#1e40af,stroke-width:3px
+    style Step1 fill:#1e3a8a,color:#fff,stroke:#1e40af,stroke-width:3px
+    style Step2a fill:#92400e,color:#fff,stroke:#b45309,stroke-width:3px
+    style Step2b fill:#15803d,color:#fff,stroke:#166534,stroke-width:3px
+    style Step3 fill:#0369a1,color:#fff,stroke:#0c4a6e,stroke-width:3px
+    style Step4 fill:#7c2d12,color:#fff,stroke:#9a3412,stroke-width:3px
+    style ExtractOK fill:#fef3c7,color:#78350f,stroke:#d97706,stroke-width:2px
+    style DealOK fill:#dcfce7,color:#166534,stroke:#22c55e,stroke-width:2px
+    style GmailOK fill:#cffafe,color:#164e63,stroke:#06b6d4,stroke-width:2px
+    style SlackOK fill:#fed7aa,color:#7c2d12,stroke:#ea580c,stroke-width:2px
+    style Success fill:#16a34a,color:#fff,stroke:#15803d,stroke-width:3px
+    style Exit2 fill:#dc2626,color:#fff,stroke:#b91c1c,stroke-width:3px
 ```
+
+### Step-by-Step Details
+
+**Step 0: Authorization**
+- Check all 4 Scalekit connectors (granolamcp, hubspot, gmail, slack)
+- If not authorized: print magic link, wait for user, loop back
+- If all ACTIVE: proceed to Step 1
+
+**Step 1: Fetch Meetings**
+- Call granolamcp_list_meetings to get recent calls
+- For each meeting, call granolamcp_get_meeting_transcript
+- Skip meetings with less than 30 characters of content
+- If no meetings found: exit cleanly (code 2)
+
+**Step 2A: Extract Meeting Info**
+- Use OpenRouter Claude to parse transcript
+- Extract: company, deal stage, amount, action items, email
+- Generate: email subject, email body, summary, next step
+- Fallback to regex if LLM fails
+
+**Step 2B: Search and Sync HubSpot**
+- Search for existing deal by company name
+- If found: call hubspot_deal_update to add meeting notes
+- If not found: call hubspot_deal_create with stage and amount
+- Result: deal ID for next steps
+
+**Step 3: Create Gmail Draft**
+- Use gmail_create_draft Scalekit tool
+- Create draft in user's Drafts folder (not sent)
+- Subject and body from extraction
+- Recipient from extraction or fallback to GMAIL_USER
+- Ready for user review before sending
+
+**Step 4: Post to Slack**
+- Format summary with meeting title, notes, actions, deal link
+- Call slack_send_message to post to configured channel
+- Returns message timestamp for tracking
+
+**Exit Codes:**
+- 0: Success - all steps completed
+- 1: Error - pipeline failed
+- 2: No meetings - graceful exit
+- 130: Interrupted by user
 
 ---
 
