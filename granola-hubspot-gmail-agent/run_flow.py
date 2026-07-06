@@ -22,28 +22,30 @@ from connectors.hubspot import HubSpotConnector
 from connectors.slack import SlackConnector
 from connectors.gmail import create_draft
 
-load_dotenv()
 
-# Load settings early
-try:
-    settings = get_settings()
-    logger = setup_logging(settings.LOG_LEVEL)
-except ValueError as e:
-    logger = setup_logging()
-    logger.error(str(e))
-    sys.exit(1)
+def _init():
+    """Initialize settings, logging, and Scalekit client."""
+    load_dotenv()
+    try:
+        settings = get_settings()
+        logger = setup_logging(settings.LOG_LEVEL)
+    except ValueError as e:
+        logger = setup_logging()
+        logger.error(str(e))
+        sys.exit(1)
 
-# Initialize Scalekit client
-sk = scalekit.client.ScalekitClient(
-    client_id=settings.SCALEKIT_CLIENT_ID,
-    client_secret=settings.SCALEKIT_CLIENT_SECRET,
-    env_url=settings.SCALEKIT_ENV_URL,
-)
-connect = sk.connect
+    sk = scalekit.client.ScalekitClient(
+        client_id=settings.SCALEKIT_CLIENT_ID,
+        client_secret=settings.SCALEKIT_CLIENT_SECRET,
+        env_url=settings.SCALEKIT_ENV_URL,
+    )
+    return settings, logger, sk.connect
 
 
 def main() -> int:
     """Run the full pipeline."""
+    settings, logger, connect = _init()
+
     try:
         # Step 0: Auth check
         logger.info("Step 0: Checking connector authorization")
@@ -156,8 +158,8 @@ def main() -> int:
     except KeyboardInterrupt:
         logger.warning("Interrupted by user")
         return 130
-    except Exception as e:
-        logger.error(f"Pipeline failed: {e}")
+    except Exception:
+        logger.exception("Pipeline failed")
         return 1
 
 
