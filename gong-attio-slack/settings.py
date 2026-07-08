@@ -64,6 +64,7 @@ def get_settings() -> Settings:
     """Get or create global settings instance."""
     global _settings
     if _settings is None:
-        _settings = Settings()
-        _settings.validate()
+        instance = Settings()
+        instance.validate()
+        _settings = instance
     return _settings

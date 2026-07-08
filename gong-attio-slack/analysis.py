@@ -37,8 +37,16 @@ Transcript:
         resp.raise_for_status()
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
+        # Strip markdown code fences if present
+        content = content.strip()
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+            content = content.rsplit("```", 1)[0]
+        content = content.strip()
         return json.loads(content)
-    except Exception:
+    except (requests.RequestException, json.JSONDecodeError, KeyError, IndexError):
         return {}
 
 
@@ -53,7 +61,7 @@ def analyze_rule_based(transcript: str, call_title: str = "") -> dict:
     sentiment = "positive" if sentiment_score > 0.6 else ("negative" if sentiment_score < 0.4 else "neutral")
 
     objections = re.findall(r"(?:concern|issue|problem|hesitation)[:\s]+([^.!?]+)", transcript, re.IGNORECASE)
-    competitors = re.findall(r"(?:competitor|alternative|other|using)\s+([A-Z][a-zA-Z0-9 ]*)", transcript)
+    competitors = re.findall(r"(?:competitor|alternative|other|using)\s+([A-Za-z][a-zA-Z0-9 ]*)", transcript, re.IGNORECASE)
     engagement = "high" if len(objections) == 0 else ("low" if len(objections) > 3 else "medium")
 
     return {
@@ -79,8 +87,10 @@ def analyze_call(transcript: str, call_title: str = "", api_key: str = "", model
 def compute_risk_score(analysis: dict) -> float:
     """Compute overall deal risk score (0.0 = safe, 1.0 = high risk)."""
     score = 0.0
-    score += (1.0 - analysis.get("sentiment_score", 0.5)) * 0.4
+    sentiment_score = float(analysis.get("sentiment_score", 0.5))
+    score += (1.0 - sentiment_score) * 0.4
     score += (1.0 if analysis.get("engagement_level") == "low" else 0.0) * 0.3
     score += min(len(analysis.get("objections", [])) / 5.0, 1.0) * 0.2
     score += (1.0 if analysis.get("competitor_mentions") else 0.0) * 0.1
+    score = max(0.0, min(score, 1.0))
     return round(score, 2)

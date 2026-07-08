@@ -82,6 +82,11 @@ def main():
     )
     args = parser.parse_args()
 
+    # Validate interval
+    if args.interval <= 0:
+        print(f"Error: --interval must be positive (got {args.interval})")
+        return 1
+
     # Setup
     load_dotenv()
     try:

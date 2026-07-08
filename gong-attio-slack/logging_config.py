@@ -25,15 +25,19 @@ class ColorFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         is_tty = sys.stdout.isatty()
         if not is_tty:
-            return f"[{self.formatTime(record, '%H:%M:%S')}] {record.levelname[0]}: {record.getMessage()}"
+            msg = f"[{self.formatTime(record, '%H:%M:%S')}] {record.levelname[0]}: {record.getMessage()}"
+            if record.exc_info:
+                msg += "\n" + self.formatException(record.exc_info)
+            return msg
 
         color = self.COLORS.get(record.levelno, self.RESET)
         icon = self.ICONS.get(record.levelno, " ")
         timestamp = self.formatTime(record, "%H:%M:%S")
         level_name = record.levelname[0]
-        return (
-            f"{color}{icon} [{timestamp}] {level_name}: {record.getMessage()}{self.RESET}"
-        )
+        msg = f"{color}{icon} [{timestamp}] {level_name}: {record.getMessage()}{self.RESET}"
+        if record.exc_info:
+            msg += "\n" + self.formatException(record.exc_info)
+        return msg
 
 
 def setup_logging(level: str = "INFO") -> logging.Logger:

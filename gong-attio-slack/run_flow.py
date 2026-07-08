@@ -29,13 +29,8 @@ from connectors.slack import SlackConnector
 def _init():
     """Initialize settings, logging, and Scalekit client."""
     load_dotenv()
-    try:
-        settings = get_settings()
-        logger = setup_logging(settings.LOG_LEVEL)
-    except ValueError as e:
-        logger = setup_logging()
-        logger.error(str(e))
-        sys.exit(1)
+    settings = get_settings()
+    logger = setup_logging(settings.LOG_LEVEL)
 
     sk = scalekit.client.ScalekitClient(
         client_id=settings.SCALEKIT_CLIENT_ID,
@@ -47,14 +42,25 @@ def _init():
 
 def main() -> int:
     """Run the full pipeline."""
-    settings, logger, connect = _init()
+    try:
+        settings, logger, connect = _init()
+    except ValueError as e:
+        logger = setup_logging()
+        logger.error(str(e))
+        return 1
 
     try:
         # Step 0: Auth check
         logger.info("Step 0: Checking connector authorization")
-        ensure_authorized(connect, settings.GONG_CONNECTOR, settings.GONG_USER)
-        ensure_authorized(connect, settings.ATTIO_CONNECTOR, settings.ATTIO_USER)
-        ensure_authorized(connect, settings.SLACK_CONNECTOR, settings.SLACK_USER)
+        if not ensure_authorized(connect, settings.GONG_CONNECTOR, settings.GONG_USER):
+            logger.error("Gong connector not authorized")
+            return 1
+        if not ensure_authorized(connect, settings.ATTIO_CONNECTOR, settings.ATTIO_USER):
+            logger.error("Attio connector not authorized")
+            return 1
+        if not ensure_authorized(connect, settings.SLACK_CONNECTOR, settings.SLACK_USER):
+            logger.error("Slack connector not authorized")
+            return 1
 
         # Step 1: Fetch calls from Gong
         logger.info("Step 1: Fetching calls from Gong")
@@ -94,9 +100,13 @@ def main() -> int:
                 risk_score = compute_risk_score(analysis)
 
                 # Fetch deal data from Attio
-                deals = attio.search_deals(company_name, limit=3)
-                deal_id = deals[0].get("id") if deals else None
-                deal_name = deals[0].get("name") if deals else company_name
+                if company_name:
+                    deals = attio.search_deals(company_name, limit=3)
+                    deal_id = deals[0].get("id") if deals else None
+                    deal_name = deals[0].get("name") if deals else company_name
+                else:
+                    deal_id = None
+                    deal_name = "Unknown"
 
                 logger.info(
                     f"Call: {call_title} | Company: {company_name} | "
