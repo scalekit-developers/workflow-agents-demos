@@ -127,9 +127,9 @@ while True:
 ```
 CPU usage: ~1% idle, waits between runs
 
-### Running Automatically
+### Running Automatically (Production)
 
-**For production, use scheduler.py (runs automatically):**
+Use scheduler.py for automatic scheduling without manual runs:
 
 ```bash
 # Every hour (default)
@@ -138,24 +138,36 @@ python scheduler.py
 # Every 12 hours (twice daily)
 python scheduler.py --interval 43200
 
-# Every N seconds
-python scheduler.py --interval 1800  # Every 30 minutes
-```
+# Every 30 minutes (testing)
+python scheduler.py --interval 1800
 
-Each run:
-1. Fetches new calls from Gong
-2. Analyzes with LLM (or rule-based fallback)
-3. Looks up deals in Attio
-4. Posts risk report to Slack DM
-5. Sleeps until next interval
-6. Repeats
-
-**For cron/manual scheduling:**
-```bash
+# Once and exit (for cron)
 python scheduler.py --once
 ```
 
-See [SCHEDULER_QUICK_START.md](SCHEDULER_QUICK_START.md) for deployment options (tmux, systemd, cron).
+**Each run executes:**
+1. Fetch calls from Gong (gong_list_calls Scalekit tool)
+2. Analyze with LLM or rule-based fallback
+3. Lookup deals in Attio (attio_search_records Scalekit tool)
+4. Post risk report to Slack DM (slack_send_message Scalekit tool)
+5. Sleep until next interval
+6. Repeat
+
+**Deployment options:**
+- Terminal: `python scheduler.py`
+- tmux: `tmux new-session -d -s agent "python scheduler.py"`
+- systemd: Auto-restart, survives reboot
+- cron: `0 */12 * * * python scheduler.py --once`
+
+**Common scheduling intervals:**
+
+| Use Case | Interval | Command |
+|----------|----------|---------|
+| Testing | 60 seconds | --interval 60 |
+| 30 minutes | 1800 seconds | --interval 1800 |
+| 1 hour | 3600 seconds | --interval 3600 |
+| 12 hours (twice daily) | 43200 seconds | --interval 43200 |
+| 24 hours (daily) | 86400 seconds | --interval 86400 |
 
 ---
 
@@ -163,31 +175,26 @@ See [SCHEDULER_QUICK_START.md](SCHEDULER_QUICK_START.md) for deployment options 
 
 ```
 gong-attio-slack/
-├── run_flow.py              # Main pipeline orchestration (one-time)
-├── scheduler.py             # Automatic scheduling (production)
-├── test_run.py              # Test runner with detailed logging
-├── settings.py              # Configuration and validation
-├── logging_config.py        # Structured logging with colors
-├── auth.py                  # Scalekit OAuth handling
-├── analysis.py              # LLM and rule-based analysis
+├── run_flow.py              # Main pipeline orchestration (152 lines)
+├── scheduler.py             # Automatic scheduling (129 lines)
+├── settings.py              # Configuration and validation (69 lines)
+├── logging_config.py        # Structured logging with colors (51 lines)
+├── auth.py                  # Scalekit OAuth handling (22 lines)
+├── analysis.py              # LLM and rule-based analysis (86 lines)
 │
-├── connectors/              # Modular connector classes
+├── connectors/              # Modular connector layer (114 lines)
 │   ├── __init__.py
-│   ├── gong.py              # Fetch calls from Gong
-│   ├── attio.py             # Search deals/companies in Attio
-│   └── slack.py             # Send messages to Slack
+│   ├── gong.py              # Fetch calls from Gong (29 lines)
+│   ├── attio.py             # Search deals/companies in Attio (39 lines)
+│   └── slack.py             # Send messages to Slack (46 lines)
 │
-├── docs/                    # Documentation
-│   ├── POLLING_AND_DATA_VERIFICATION.md
-│   ├── RUNNING_AND_VERIFICATION.md
-│   └── SCHEDULING.md
-│
-├── requirements.txt         # Python dependencies (includes schedule)
+├── requirements.txt         # Python dependencies
 ├── .env.example             # Environment template
 ├── .gitignore              # Git ignore patterns
-├── README.md               # This file
-└── SCHEDULER_QUICK_START.md # Quick reference for scheduling
+└── README.md               # This file
 ```
+
+**Total Production Code:** 495 lines across 12 files
 
 ---
 
