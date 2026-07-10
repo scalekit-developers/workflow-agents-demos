@@ -20,6 +20,47 @@ For every new Zendesk ticket, the agent runs a five-step pipeline:
 
 **Severity levels:** P0 (service down), P1 (major issue), P2 (minor), P3 (question)
 
+## Architecture
+
+```mermaid
+graph TB
+    subgraph External["External APIs"]
+        Z["Zendesk API"]
+        S["Slack API"]
+        N["Notion API"]
+        LLM["OpenRouter LLM"]
+    end
+
+    subgraph Scalekit["Scalekit Agent Auth"]
+        OAUTH["OAuth Token Vault"]
+        TOOLS["Tool Executor"]
+    end
+
+    subgraph Core["Agent Core"]
+        CONFIG["Configuration"]
+        LOGGING["Structured Logging"]
+        STATE["State Management"]
+    end
+
+    subgraph Pipeline["Triage Pipeline"]
+        F["Fetch Tickets"]
+        C["Classify"]
+        KB["Search KB"]
+        R["Route to Slack"]
+        U["Update Zendesk"]
+    end
+
+    External --> Scalekit
+    Scalekit --> Core
+    Core --> Pipeline
+    Pipeline --> Output["Exit Code"]
+
+    Z -.->|Via Scalekit| F
+    S -.->|Via Scalekit| R
+    N -.->|Via Scalekit| KB
+    LLM -.->|Direct Call| C
+```
+
 ## Prerequisites
 
 - Python 3.11+
@@ -27,7 +68,7 @@ For every new Zendesk ticket, the agent runs a five-step pipeline:
 - A Zendesk account with API access enabled
 - A Notion workspace with a knowledge base database
 - A Slack workspace with routing channels (e.g., #engineering, #billing, #support-triage)
-- An [OpenRouter](https://openrouter.ai) API key
+- An [OpenRouter](https://openrouter.ai) API key (optional; falls back to rule-based classification)
 
 ## Setup
 
@@ -61,98 +102,252 @@ In the [Scalekit dashboard](https://scalekit.com), add three connectors under Ag
 python run_flow.py
 ```
 
-## How It Works
+## Usage
 
+### One-Time Mode (Default)
+
+Process pending tickets once and exit:
+
+```bash
+python run_flow.py
 ```
--- Step 0: Checking connector auth --
-  zendesk (support@yourcompany.com) -- ACTIVE
-  slack (support@yourcompany.com) -- ACTIVE
-  notion (support@yourcompany.com) -- ACTIVE
 
--- Step 1: Fetching new Zendesk tickets --
-  Found 3 new ticket(s)
+This mode is ideal for:
+- Cron jobs (e.g., `0 * * * * cd /path/to/agent && python run_flow.py`)
+- CI/CD pipelines
+- Manual testing
+- Lambda/serverless functions
 
--- Step 2: Classifying ticket --
-  Ticket #4: "Billing charged twice for March subscription"
-  Category: billing | Severity: P1
+### Continuous Mode (Polling)
 
--- Step 3: Searching Notion KB --
-  Skipped (category 'billing' does not require KB search)
+Run indefinitely, processing tickets every N minutes:
 
--- Step 4: Routing to Slack --
-  Posted to #billing
-
--- Step 5: Updating Zendesk ticket --
-  Tags added, internal note created
-
-Flow complete. Processed 3 ticket(s).
+```bash
+POLLING_MODE=true POLL_INTERVAL_MINUTES=5 python run_flow.py
 ```
+
+Press Ctrl+C to stop gracefully.
+
+This mode is ideal for:
+- Long-running services
+- systemd services
+- Docker containers
+- Always-on deployments
 
 ## Configuration
 
-All configuration is done through environment variables in `.env`:
+Environment variables (set in `.env`):
 
-### Required
-
-| Variable | Description |
-|----------|-------------|
-| `SCALEKIT_ENV_URL` | Your Scalekit workspace URL |
-| `SCALEKIT_CLIENT_ID` | Scalekit client ID |
-| `SCALEKIT_CLIENT_SECRET` | Scalekit client secret |
-| `ZENDESK_USER` | Email used for the Zendesk connected account |
-| `SLACK_USER` | Email used for the Slack connected account |
-| `NOTION_USER` | Email used for the Notion connected account |
-| `OPENROUTER_API_KEY` | OpenRouter API key for LLM classification |
-
-### Optional
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SLACK_CONNECTOR` | `slack` | Connector name in Scalekit dashboard |
-| `NOTION_DB_ID` | _(empty)_ | Target a specific Notion database for KB search |
-| `OPENROUTER_MODEL` | `openai/gpt-4o-mini` | LLM model for classification |
-| `POLLING_MODE` | `false` | Set to `true` for continuous polling |
-| `POLL_INTERVAL_MINUTES` | `2` | Minutes between polling cycles |
-| `CHANNEL_BUG` | `#engineering` | Slack channel for bug tickets |
-| `CHANNEL_BILLING` | `#billing` | Slack channel for billing tickets |
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `SCALEKIT_ENV_URL` | — | Required: Your Scalekit workspace URL |
+| `SCALEKIT_CLIENT_ID` | — | Required: Scalekit client ID |
+| `SCALEKIT_CLIENT_SECRET` | — | Required: Scalekit client secret |
+| `ZENDESK_USER` | — | Required: Email used to authorize Zendesk |
+| `SLACK_USER` | — | Required: Email used to authorize Slack |
+| `NOTION_USER` | — | Required: Email used to authorize Notion |
+| `SLACK_CONNECTOR` | `slack` | Connector name from Scalekit dashboard |
+| `NOTION_DB_ID` | (empty) | Optional: Notion database ID for direct query |
+| `SUPPORT_EMAIL` | `ZENDESK_USER` | Fallback email for routing |
+| `CHANNEL_BUG` | `#engineering` | Slack channel for bugs |
+| `CHANNEL_BILLING` | `#billing` | Slack channel for billing |
 | `CHANNEL_FEATURE` | `#product-feedback` | Slack channel for feature requests |
 | `CHANNEL_HOWTO` | `#support-triage` | Slack channel for how-to questions |
 | `CHANNEL_ACCOUNT` | `#support-triage` | Slack channel for account issues |
-| `FALLBACK_CHANNEL` | `#support-triage` | Fallback channel if primary post fails |
+| `FALLBACK_CHANNEL` | `#support-triage` | Fallback if category unmapped |
+| `POLLING_MODE` | `false` | Enable continuous polling |
+| `POLL_INTERVAL_MINUTES` | `2` | Minutes between polling cycles |
+| `LOG_LEVEL` | `INFO` | Logging level: DEBUG, INFO, WARNING, ERROR |
+| `OPENROUTER_API_KEY` | (empty) | Optional: For LLM classification |
+| `OPENROUTER_MODEL` | `openai/gpt-4o-mini` | LLM model to use |
 
-## Polling Mode
+## How It Works
 
-For continuous monitoring, enable polling:
+```
+[14:32:10] I: Step 0: Checking connector auth
+[14:32:12] I: ✓ zendesk (support@yourcompany.com) -- ACTIVE
+[14:32:13] I: ✓ slack (support@yourcompany.com) -- ACTIVE
+[14:32:14] I: ✓ notion (support@yourcompany.com) -- ACTIVE
 
-```env
-POLLING_MODE=true
-POLL_INTERVAL_MINUTES=2
+[14:32:15] I: Step 1: Fetching new Zendesk tickets
+[14:32:18] I: Found 3 new ticket(s)
+
+[14:32:19] I: Step 2: Classifying ticket #4
+[14:32:22] I: Category: billing | Severity: P1 | Subject: Billing charged twice...
+[14:32:22] D: LLM classification OK
+
+[14:32:23] D: Step 3: Searching Notion KB
+[14:32:24] D: Skipped KB search (category 'billing' does not require it)
+
+[14:32:25] D: Step 4: Routing to Slack
+[14:32:26] I: Routed to Slack channel: #billing
+
+[14:32:27] D: Step 5: Updating Zendesk ticket
+[14:32:29] I: ✓ Ticket #4 triaged successfully
 ```
 
-For business-hours-only coverage via cron:
+## Exit Codes
+
+| Code | Meaning | Use Case |
+|------|---------|----------|
+| `0` | Success | ✓ Tickets processed, or no new tickets (polling mode continues) |
+| `1` | Error | ✗ Auth failed, config missing, or 5 consecutive errors (investigate logs) |
+| `2` | No data | ✓ No new tickets in one-time mode (normal, not an error) |
+| `130` | Interrupted | ✓ Graceful shutdown via Ctrl+C or SIGTERM |
+
+## Monitoring
+
+### Logging
+
+The agent produces structured logs with timestamps, levels, and auto-redacted secrets:
 
 ```bash
-*/2 9-18 * * 1-5 cd /path/to/agent && python run_flow.py >> logs/run.log 2>&1
+# Show all logs
+python run_flow.py
+
+# Show only errors
+LOG_LEVEL=ERROR python run_flow.py
+
+# Show debug info
+LOG_LEVEL=DEBUG python run_flow.py
 ```
 
-## Architecture
+Log levels:
+- `DEBUG` — Detailed execution flow, skipped steps
+- `INFO` — Key milestones, tickets processed, routes
+- `WARNING` — Auth issues, partial failures, fallbacks
+- `ERROR` — Unrecoverable failures, missing config
 
-```
-Zendesk  ──┐
-            ├──  Scalekit Agent Auth  ──  run_flow.py  ──  OpenRouter LLM
-Notion   ──┤     (execute_tool)
-            │
-Slack    ──┘
+### Polling Loop
+
+When `POLLING_MODE=true`, the agent runs continuously:
+
+```bash
+# Run every minute (for testing)
+POLLING_MODE=true POLL_INTERVAL_MINUTES=1 python run_flow.py
+
+# Run every 5 minutes (production)
+POLLING_MODE=true POLL_INTERVAL_MINUTES=5 python run_flow.py
+
+# Press Ctrl+C to stop gracefully
+# Agent finishes current ticket and exits with code 130
 ```
 
-Every API call to Zendesk, Notion, and Slack goes through Scalekit's `actions.execute_tool()`. Token refresh, scope management, and connection state are handled automatically.
+### State
 
-## Project Structure
+Processed ticket IDs are stored in `state/processed_tickets.json`. This prevents duplicate processing across restarts.
 
+```bash
+# Clear processed tickets (useful for testing)
+rm -f state/processed_tickets.json
 ```
-zendesk-slack-notion-claude-agent/
-  run_flow.py       # The complete triage agent (single file)
-  .env.example      # Template for environment variables
-  .gitignore        # Ignores .env, state/, __pycache__/
-  README.md         # This file
+
+## Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| `ModuleNotFoundError: scalekit` | Run `pip install -r requirements.txt` or `pip install scalekit-sdk-python requests python-dotenv` |
+| `Missing Scalekit credentials` | Run `cp .env.example .env` and fill in your values from the Scalekit dashboard |
+| `connector (...) -- INACTIVE` | Open the auth link printed in logs; if non-interactive, authorize in Scalekit dashboard |
+| `No colored output` | Colors auto-disable when output is piped. To force colors: set `FORCE_COLOR=1` |
+| `Too many logs` | Set `LOG_LEVEL=WARNING` or `LOG_LEVEL=ERROR` |
+| `Agent processes same ticket twice` | Remove `state/processed_tickets.json` if corrupted |
+| `LLM classification fails` | Ensure `OPENROUTER_API_KEY` is set; agent falls back to rule-based classification |
+| `Slack messages fail` | Verify bot has `chat:write` scope and is invited to channels |
+| `Notion search returns no results` | Try setting `NOTION_DB_ID` explicitly; ensure database is shared with integration |
+
+## Deployment
+
+### systemd Service (Linux)
+
+Create `/etc/systemd/system/zendesk-triage.service`:
+
+```ini
+[Unit]
+Description=Zendesk Support Triage Agent
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/zendesk-triage-agent
+Environment="PATH=/opt/zendesk-triage-agent/venv/bin"
+ExecStart=/opt/zendesk-triage-agent/venv/bin/python run_flow.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
 ```
+
+Enable and start:
+
+```bash
+sudo systemctl enable zendesk-triage
+sudo systemctl start zendesk-triage
+sudo journalctl -u zendesk-triage -f  # View logs
+```
+
+### Docker
+
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY . .
+
+ENV POLLING_MODE=true
+ENV POLL_INTERVAL_MINUTES=5
+
+CMD ["python", "run_flow.py"]
+```
+
+Build and run:
+
+```bash
+docker build -t zendesk-triage .
+docker run --env-file .env zendesk-triage
+```
+
+### Cron (Hourly Processing)
+
+Add to crontab:
+
+```bash
+0 * * * * cd /path/to/agent && python run_flow.py >> /var/log/zendesk-triage.log 2>&1
+```
+
+## Production Checklist
+
+- [x] Pure Scalekit (no direct API imports)
+- [x] All APIs via `sk.actions.execute_tool()`
+- [x] Structured logging with colors
+- [x] TTY-aware output (auto-disables in CI)
+- [x] LOG_LEVEL env var working
+- [x] No secrets in logs (auto-redacted)
+- [x] Exit codes: 0/1/2/130
+- [x] Graceful shutdown (Ctrl+C)
+- [x] Polling + one-time modes
+- [x] POLLING_MODE env var
+- [x] POLL_INTERVAL_MINUTES configurable
+- [x] Consecutive error tracking
+- [x] .env.example clean (no secrets)
+- [x] Startup validation (fail fast)
+- [x] Configuration from env vars only
+- [x] README with architecture diagram
+- [x] Exit codes documented
+- [x] Troubleshooting guide
+
+## License
+
+MIT
+
+---
+
+**Ready for production.** Deploy with confidence.
