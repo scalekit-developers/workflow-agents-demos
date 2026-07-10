@@ -165,7 +165,9 @@ def process_message(identifier: str, msg_stub: dict, processed: set) -> bool:
         (h["value"] for h in (full.get("payload") or {}).get("headers", [])
          if h.get("name") == "Subject"), ""
     ) or "(no subject)"
-    body = _extract_body(full) or full.get("snippet") or ""
+    body = _extract_body(full)
+    if not body:
+        body = full.get("snippet") or ""
 
     log.info("%s  %s", ICONS["email"], subject[:80])
 
@@ -245,9 +247,9 @@ def process_message(identifier: str, msg_stub: dict, processed: set) -> bool:
     if reply_to:
         slot_str = human_slot((proposed_start, proposed_end), USER_TZ)
         draft_body = (
-            f"Hi,\n\n"
+            "Hi,\n\n"
             f"I've scheduled '{ent.title}' for {slot_str}.\n"
-            f"A calendar invite has been sent to all attendees.\n"
+            "A calendar invite has been sent to all attendees.\n"
             + (f"\nEvent: {event_link}\n" if event_link else "")
             + "\nBest regards"
         )

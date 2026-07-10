@@ -53,8 +53,10 @@ def create_draft(identifier: str, to: str, subject: str, body: str) -> Dict:
         try:
             data = execute_tool("gmail_create_draft", params, identifier)
             return data if isinstance(data, dict) else {}
-        except Exception as exc:
+        except (ValueError, KeyError, TypeError) as exc:
             last_exc = exc
+        except Exception as exc:
+            raise exc
     if last_exc is not None:
         raise last_exc
     return {}

@@ -100,7 +100,7 @@ def parse_entities(subject: str, body_raw: str, headers: Dict, *,
     tz_str = extracted.get("timezone") or user_tz
     try:
         local_tz = pytz.timezone(tz_str)
-    except pytz.UnknownTimeZoneError:
+    except (pytz.UnknownTimeZoneError, AttributeError):
         tz_str = user_tz
         local_tz = pytz.timezone(user_tz)
 

@@ -13,9 +13,9 @@ _client: Optional[ScalekitClient] = None
 def _get_client() -> ScalekitClient:
     global _client
     if _client is None:
-        env_url = os.getenv("SCALEKIT_ENV_URL", "")
-        client_id = os.getenv("SCALEKIT_CLIENT_ID", "")
-        client_secret = os.getenv("SCALEKIT_CLIENT_SECRET", "")
+        env_url = os.getenv("SCALEKIT_ENV_URL", "").strip()
+        client_id = os.getenv("SCALEKIT_CLIENT_ID", "").strip()
+        client_secret = os.getenv("SCALEKIT_CLIENT_SECRET", "").strip()
         missing = [k for k, v in {
             "SCALEKIT_ENV_URL": env_url,
             "SCALEKIT_CLIENT_ID": client_id,
@@ -60,12 +60,22 @@ def get_access_token(connection_name: str, identifier: str) -> str:
             f"authorize via Scalekit dashboard first."
         )
     auth = account.authorization_details
-    if not isinstance(auth, dict) or "oauth_token" not in auth:
+    if not isinstance(auth, dict):
         raise RuntimeError(
-            f"No OAuth token for '{connection_name}' / '{identifier}' — "
+            f"No authorization details for '{connection_name}' / '{identifier}' — "
             f"connector may use non-OAuth credentials."
         )
-    return auth["oauth_token"]["access_token"]
+    if "oauth_token" not in auth:
+        raise RuntimeError(
+            f"No oauth_token in authorization details for '{connection_name}' / '{identifier}' — "
+            f"connector may use non-OAuth credentials."
+        )
+    oauth_token = auth.get("oauth_token")
+    if not isinstance(oauth_token, dict) or "access_token" not in oauth_token:
+        raise RuntimeError(
+            f"Invalid oauth_token structure for '{connection_name}' / '{identifier}'."
+        )
+    return oauth_token["access_token"]
 
 
 def ensure_connected(connection_name: str, identifier: str) -> None:

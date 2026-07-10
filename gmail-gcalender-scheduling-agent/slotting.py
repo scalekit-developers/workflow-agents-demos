@@ -30,6 +30,10 @@ def derive_busy(events: list, local_tz: pytz.BaseTzInfo) -> List[Tuple[datetime,
             print(f"Error parsing dates: {ex}")
             continue
 
+        # For all-day events, normalize date to end-of-day
+        if not isinstance(s, str) or 'T' not in s:
+            tdt = tdt + timedelta(days=1)
+
         # Check if timezone information is missing and localize if necessary
         if not sdt.tzinfo:
             sdt = local_tz.localize(sdt)
