@@ -1,235 +1,151 @@
+# parsers.py — LLM-based email intent + entity extraction
+
 from __future__ import annotations
+import json
 import os
 import re
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pytz
-import dateparser
-from dateutil import parser as du
 
-from entities import ParsedEmail, Attendee
+from entities import Attendee, ParsedEmail
 
-DUR_RE = re.compile(r"\b(\d+)\s*(min|mins|minutes|hour|hours|hr|hrs)\b", re.I)
-TZ_HINTS = [
-    (re.compile(r"\bIST\b", re.I), "Asia/Kolkata"),
-    (re.compile(r"\bPST\b|\bPT\b", re.I), "America/Los_Angeles"),
-    (re.compile(r"\bCET\b", re.I), "Europe/Paris"),
-    (re.compile(r"\bBST\b|\bUK time\b", re.I), "Europe/London"),
-]
+import anthropic as _anthropic
 
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 HTML_TAG_RE = re.compile(r"<[^>]+>")
-EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
+
+_anthropic_client: Optional[_anthropic.Anthropic] = None
 
 
-def strip_html(text: str | None) -> str:
+def _get_anthropic() -> Optional[_anthropic.Anthropic]:
+    global _anthropic_client
+    if not ANTHROPIC_API_KEY:
+        return None
+    if _anthropic_client is None:
+        _anthropic_client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _anthropic_client
+
+
+def _strip_html(text: str | None) -> str:
     return HTML_TAG_RE.sub(" ", text or "")
+
+
+def _extract_emails_from_headers(headers: Dict) -> List[str]:
+    seen = set()
+    emails = []
+    for key in ("To", "Cc", "From", "to", "cc", "from"):
+        for e in EMAIL_RE.findall(headers.get(key) or ""):
+            if e.lower() not in seen:
+                seen.add(e.lower())
+                emails.append(e)
+    return emails
+
+
+def _llm_extract(subject: str, body: str, header_emails: List[str],
+                 user_tz: str, today_iso: str) -> Optional[Dict]:
+    """Call Claude to extract scheduling intent and entities."""
+    client = _get_anthropic()
+    if not client:
+        return None
+
+    prompt = f"""Today is {today_iso}. The user's timezone is {user_tz}.
+
+Email subject: {subject}
+Email body (first 1500 chars): {body[:1500]}
+Email header contacts: {', '.join(header_emails)}
+
+Does this email contain a scheduling request (meeting invite, "let's sync", "can we meet", calendar event, etc.)?
+
+If YES, extract and return ONLY this JSON:
+{{
+  "is_scheduling": true,
+  "title": "<meeting title>",
+  "duration_minutes": <int, default 30>,
+  "start_datetime": "<ISO 8601 with timezone, or null if unknown>",
+  "end_datetime": "<ISO 8601 with timezone, or null if unknown>",
+  "timezone": "<IANA tz string, e.g. Asia/Kolkata>",
+  "attendees": ["email1@example.com", "email2@example.com"]
+}}
+
+If NO (not a scheduling email), return ONLY:
+{{"is_scheduling": false}}
+
+Return raw JSON only, no explanation."""
+
+    msg = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=512,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = msg.content[0].text.strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.S).strip()
+    return json.loads(raw)
 
 
 def parse_entities(subject: str, body_raw: str, headers: Dict, *,
                    user_tz: str = "Asia/Kolkata", default_duration: int = 30) -> ParsedEmail:
-    """
-    Minimal changes:
-    - Keep your duration/tz logic
-    - Parse exact date-times as before
-    - NEW: if only a date is present (no time), set start at WORK_START_LOCAL in user_tz
-    - Also recognizes HTML microdata: itemprop="startDate" datetime="YYYYMMDD"
-    """
-    body = strip_html(body_raw)
-    title = (subject or "Meeting").strip()[:120]
-    work_start_hm = os.getenv("WORK_START_LOCAL", "10:00")
+    body = _strip_html(body_raw)
+    header_emails = _extract_emails_from_headers(headers)
+    today_iso = datetime.now(pytz.timezone(user_tz)).date().isoformat()
 
-    # duration
-    m = DUR_RE.search(body)
-    if m:
-        val = int(m.group(1))
-        unit = m.group(2).lower()
-        duration = val * 60 if unit.startswith(("hr", "hour")) else val
-    else:
-        duration = default_duration
+    extracted = _llm_extract(subject, body, header_emails, user_tz, today_iso)
 
-    # tz hint (scan subject + body)
-    tz_hint = None
-    for rx, tz in TZ_HINTS:
-        if rx.search(subject or "") or rx.search(body):
-            tz_hint = tz
-            break
+    # If LLM says not a scheduling email or returned nothing, return empty ParsedEmail
+    if not extracted or not extracted.get("is_scheduling"):
+        return ParsedEmail(title=subject or "Meeting", attendees=[])
 
-    # exact datetime candidates (subject + body)
-    text_all = f"{subject or ''}\n{body}"
-    # If subject contains a 4-digit year, remember it to correct parser heuristics
-    expected_year = None
-    m_year = re.search(r"\b(20\d{2})\b", subject or "")
-    if m_year:
+    tz_str = extracted.get("timezone") or user_tz
+    try:
+        local_tz = pytz.timezone(tz_str)
+    except (pytz.UnknownTimeZoneError, AttributeError):
+        tz_str = user_tz
+        local_tz = pytz.timezone(user_tz)
+
+    hard_start: Optional[datetime] = None
+    hard_end: Optional[datetime] = None
+
+    if extracted.get("start_datetime"):
         try:
-            expected_year = int(m_year.group(1))
-        except Exception:
-            expected_year = None
-    hard_start = None
-    hard_end = None
-    local_tz = pytz.timezone(tz_hint or user_tz)
-
-    # Strong subject pattern: "Tue Oct 28, 2025 5:45pm - 7:45pm (IST)"
-    subj_pat = re.compile(
-        r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
-        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
-        r"(\d{1,2}),\s*(\d{4})\s+"
-        r"(\d{1,2}:\d{2})\s*(am|pm)"
-        r"(?:\s*[-–—]\s*(\d{1,2}:\d{2})\s*(am|pm))?",
-        re.I
-    )
-    m_subj = subj_pat.search(subject or "")
-    if m_subj:
-        dow, mon_abbr, day, year, t1, ap1, t2, ap2 = (
-            m_subj.group(1), m_subj.group(2), m_subj.group(3), m_subj.group(4),
-            m_subj.group(5), m_subj.group(6), m_subj.group(7), m_subj.group(8)
-        )
-        month_map = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-        mo = month_map.index(mon_abbr.title()) + 1
-        hh, mm = map(int, t1.split(":"))
-        if ap1.lower() == "pm" and hh != 12:
-            hh += 12
-        if ap1.lower() == "am" and hh == 12:
-            hh = 0
-        local_tz = pytz.timezone(tz_hint or user_tz)
-        try:
-            start_naive = datetime(int(year), mo, int(day), hh, mm)
-            hard_start = local_tz.localize(start_naive)
-            if t2 and ap2:
-                eh, em = map(int, t2.split(":"))
-                if ap2.lower() == "pm" and eh != 12:
-                    eh += 12
-                if ap2.lower() == "am" and eh == 12:
-                    eh = 0
-                end_naive = datetime(int(year), mo, int(day), eh, em)
-                hard_end = local_tz.localize(end_naive)
-                # Update duration from explicit end time
-                try:
-                    duration = max(1, int((hard_end - hard_start).total_seconds() // 60))
-                except Exception:
-                    pass
-            else:
-                hard_end = hard_start + timedelta(minutes=duration)
+            hard_start = datetime.fromisoformat(extracted["start_datetime"])
+            if not hard_start.tzinfo:
+                hard_start = local_tz.localize(hard_start)
         except Exception:
             hard_start = None
+
+    if extracted.get("end_datetime"):
+        try:
+            hard_end = datetime.fromisoformat(extracted["end_datetime"])
+            if not hard_end.tzinfo:
+                hard_end = local_tz.localize(hard_end)
+        except Exception:
             hard_end = None
 
-    # Generic parse fallback across subject+body if still missing
-    if not hard_start:
-        candidates = re.findall(
-            r"([A-Za-z]{3,9}\s+\d{1,2}.*?\d{1,2}(:\d{2})?\s*(am|pm)?)|(\d{4}-\d{2}-\d{2}[\sT]\d{1,2}:\d{2})",
-            text_all,
-            flags=re.I
-        )
-        for tup in candidates:
-            text = next((t for t in tup if t), None)
-            if not text:
-                continue
-            try:
-                settings = {"TIMEZONE": tz_hint or user_tz, "RETURN_AS_TIMEZONE_AWARE": True}
-                parsed = dateparser.parse(text, settings=settings)
-                if parsed:
-                    hard_start = parsed
-                    hard_end = hard_start + timedelta(minutes=duration)
-                    break
-            except Exception:
-                continue
-
-    # Final correction: if parser chose an obviously wrong or past year but subject had a year
-    if hard_start and expected_year and hard_start.year != expected_year:
-        try:
-            local_tz = pytz.timezone(tz_hint or user_tz)
-            s_local = hard_start.astimezone(local_tz) if hard_start.tzinfo else local_tz.localize(hard_start)
-            corrected = s_local.replace(year=expected_year)
-            hard_end = corrected + timedelta(minutes=duration)
-            hard_start = corrected
-        except Exception:
-            pass
-
-    # Also, if parsed time is > 365 days in the past relative to now, bump to next occurrence of that month/day
-    if hard_start:
-        try:
-            now_local = datetime.now(pytz.timezone(tz_hint or user_tz))
-            if (now_local - hard_start).days > 365:
-                y = now_local.year if hard_start.month >= now_local.month else now_local.year + 1
-                local_tz = pytz.timezone(tz_hint or user_tz)
-                s_local = hard_start.astimezone(local_tz)
-                corrected = local_tz.localize(datetime(y, s_local.month, s_local.day, s_local.hour, s_local.minute))
-                hard_end = corrected + timedelta(minutes=duration)
-                hard_start = corrected
-        except Exception:
-            pass
-
-    # Final sync: if both hard_start and hard_end present, ensure duration matches
+    raw_duration = extracted.get("duration_minutes")
+    duration = int(raw_duration) if isinstance(raw_duration, (int, float)) else default_duration
+    if hard_start and not hard_end:
+        hard_end = hard_start + timedelta(minutes=duration)
     if hard_start and hard_end:
-        try:
-            duration = max(1, int((hard_end - hard_start).total_seconds() // 60))
-        except Exception:
-            pass
+        duration = max(1, int((hard_end - hard_start).total_seconds() // 60))
 
-    # NEW: date-only patterns → default to WORK_START_LOCAL time
-    if not hard_start:
-        # Pattern like: "@ Thu Oct 16, 2025"
-        m_date_only = re.search(
-            r'@\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+'
-            r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+'
-            r'(\d{1,2}),\s*(\d{4})',
-            text_all,
-            re.IGNORECASE
-        )
-        if m_date_only:
-            mon_abbr = m_date_only.group(2).title()
-            day = int(m_date_only.group(3))
-            year = int(m_date_only.group(4))
-            month_map = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-            try:
-                h, mm = work_start_hm.split(":")
-                start_naive = datetime(
-                    year,
-                    month_map.index(mon_abbr) + 1,
-                    day,
-                    int(h), int(mm)
-                )
-                hard_start = local_tz.localize(start_naive)
-                hard_end = hard_start + timedelta(minutes=duration)
-            except Exception:
-                pass
-
-    if not hard_start:
-        # HTML microdata: itemprop="startDate" datetime="YYYYMMDD"
-        m_meta = re.search(r'itemprop="startDate"\s+datetime="(\d{8})"', text_all)
-        if m_meta:
-            ymd = m_meta.group(1)
-            try:
-                y = int(ymd[0:4]); mo = int(ymd[4:6]); d = int(ymd[6:8])
-                h, mm = work_start_hm.split(":")
-                start_naive = datetime(y, mo, d, int(h), int(mm))
-                hard_start = local_tz.localize(start_naive)
-                hard_end = hard_start + timedelta(minutes=duration)
-            except Exception:
-                pass
-
-    # phrase fallback (unchanged)
-    phrase_match = re.search(
-        r"(tomorrow|next\s+\w+|monday|tuesday|wednesday|thursday|friday|saturday|sunday|afternoon|morning|evening)[^.\n]{0,50}",
-        body, flags=re.I
-    )
-    date_phrase = phrase_match.group(0).strip() if phrase_match else None
-
-    # attendees from headers (unchanged)
+    # Merge LLM attendees + header emails, deduplicate
+    seen: set = set()
     attendees: List[Attendee] = []
-    for key in ("To", "Cc", "From", "to", "cc", "from"):
-        val = headers.get(key) or ""
-        for e in EMAIL_RE.findall(val):
-            if e.lower() not in {a.email.lower() for a in attendees}:
-                attendees.append(Attendee(email=e))
+    raw_attendees = extracted.get("attendees") or []
+    for e in raw_attendees + header_emails:
+        if not isinstance(e, str) or not e.strip():
+            continue
+        if e.lower() not in seen:
+            seen.add(e.lower())
+            attendees.append(Attendee(email=e))
 
     return ParsedEmail(
-        title=title,
+        title=extracted.get("title") or subject or "Meeting",
         duration_minutes=duration,
-        tz_hint=tz_hint,
+        tz_hint=tz_str,
         hard_start=hard_start,
         hard_end=hard_end,
-        date_phrase=date_phrase,
         attendees=attendees,
     )

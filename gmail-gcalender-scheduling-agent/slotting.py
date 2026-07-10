@@ -10,15 +10,15 @@ def iso(dt: datetime) -> str:
 
 def derive_busy(events: list, local_tz: pytz.BaseTzInfo) -> List[Tuple[datetime, datetime]]:
     busy = []
-    
+
     for e in events:
         if not isinstance(e, dict):
             continue
         start = e.get("start")
         end = e.get("end")
-        
-        s = start.get("dateTime") if isinstance(start, dict) else start
-        t = end.get("dateTime") if isinstance(end, dict) else end
+
+        s = (start.get("dateTime") or start.get("date")) if isinstance(start, dict) else start
+        t = (end.get("dateTime") or end.get("date")) if isinstance(end, dict) else end
         if not s or not t:
             continue
 
@@ -29,6 +29,10 @@ def derive_busy(events: list, local_tz: pytz.BaseTzInfo) -> List[Tuple[datetime,
         except Exception as ex:
             print(f"Error parsing dates: {ex}")
             continue
+
+        # For all-day events, normalize date to end-of-day
+        if not isinstance(s, str) or 'T' not in s:
+            tdt = tdt + timedelta(days=1)
 
         # Check if timezone information is missing and localize if necessary
         if not sdt.tzinfo:
@@ -51,7 +55,7 @@ def suggest_slots(busy: List[Tuple[datetime, datetime]], *,
                   days_ahead: int = 10, limit: int = 5) -> List[Tuple[datetime, datetime]]:
     """Suggest the first `limit` free slots avoiding existing busy times plus buffer."""
     slots: List[Tuple[datetime, datetime]] = []
-    for d in range(1, days_ahead + 1):
+    for d in range(0, days_ahead + 1):
         if len(slots) >= limit:
             break
         day = now_local + timedelta(days=d)
@@ -75,4 +79,4 @@ def suggest_slots(busy: List[Tuple[datetime, datetime]], *,
 
 def human_slot(slot: Tuple[datetime, datetime], tz_label: str) -> str:
     s, e = slot
-    return f"{s:%a, %b %d} — {s:%I:%M %p}–{e:%I:%M %p} {tz_label}"
+    return f"{s:%a, %b %d} - {s:%I:%M %p}-{e:%I:%M %p} {tz_label}"

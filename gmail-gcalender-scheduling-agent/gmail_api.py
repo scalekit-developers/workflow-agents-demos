@@ -1,79 +1,73 @@
-# gmail_api.py
+# gmail_api.py — Gmail via Scalekit connector tools only
+
 from __future__ import annotations
-from typing import Dict, List, Any
+from typing import Dict, List
 
-from sk_connectors import get_connector
-
-connector = get_connector()
+from sk_connectors import execute_tool
 
 
-def _extract_messages(obj: Any) -> List[Dict]:
-    """
-    Normalize Scalekit/Gmail response shapes to a list of message dicts.
-    Primary (your env): {"data": {"messages": [...] , "page_token": "..."}}
-    Fallbacks included for safety.
-    """
-    if obj is None:
-        return []
-
-    # 1) Your primary shape
-    if isinstance(obj, dict):
-        data = obj.get("data")
-        if isinstance(data, dict) and isinstance(data.get("messages"), list):
-            return [m for m in data["messages"] if isinstance(m, dict)]
-
-        # 2) Some envs put messages at top level
-        if isinstance(obj.get("messages"), list):
-            return [m for m in obj["messages"] if isinstance(m, dict)]
-
-        # 3) Generic wrappers
-        for wrap in ("result", "response"):
-            inner = obj.get(wrap)
-            if isinstance(inner, dict) and isinstance(inner.get("messages"), list):
-                return [m for m in inner["messages"] if isinstance(m, dict)]
-            if isinstance(inner, list):
-                return [m for m in inner if isinstance(m, dict)]
-
-        # 4) Single message dict
-        if obj.get("id") or obj.get("messageId"):
-            return [obj]
-
-    # 5) Top-level list
-    if isinstance(obj, list):
-        return [m for m in obj if isinstance(m, dict)]
-
+def fetch_emails(identifier: str, query: str, max_results: int = 20) -> List[Dict]:
+    data = execute_tool(
+        "gmail_fetch_mails",
+        {"query": query, "max_results": max_results},
+        identifier,
+    )
+    if isinstance(data, dict):
+        return data.get("messages") or []
     return []
 
 
-def fetch_emails(identifier: str, query: str, max_results: int = 50) -> List[Dict]:
-    res = connector.execute_action_with_retry(
-        identifier=identifier,
-        tool="gmail_fetch_mails",
-        parameters={"query": query, "maxResults": max_results}
-    ) 
-    return _extract_messages(res)
-
 def get_message(identifier: str, message_id: str) -> Dict:
-    res = connector.execute_action_with_retry(
-        identifier=identifier,
-        tool="gmail_get_message_by_id",
-        parameters={  # 👈 use snake_case key
-            "message_id": message_id,
-            "format": "full"
-        }
+    data = execute_tool(
+        "gmail_get_message_by_id",
+        {"message_id": message_id, "format": "full"},
+        identifier,
     )
-    # Normalize common response shapes to the actual message dict
-    if not isinstance(res, dict):
-        return {}
-
-    data = res.get("data") or res.get("result") or res.get("response") or res
-
     if isinstance(data, dict):
-        # Some envs nest under "message"
-        if isinstance(data.get("message"), dict):
-            return data["message"]
-        # Or return the dict if it looks like a Gmail message
-        if data.get("id") or data.get("payload") or data.get("threadId"):
-            return data
-
+        return data.get("message") or data
     return {}
+
+
+def create_draft(identifier: str, to: str, subject: str, body: str) -> Dict:
+    attempts = [
+        {
+            "to": to,
+            "subject": subject,
+            "body": body,
+        },
+        {
+            "to": to,
+            "subject": subject,
+            "body": body,
+            "content_type": "text/plain",
+        },
+        {
+            "to": [to],
+            "subject": subject,
+            "body": body,
+            "content_type": "text/plain",
+        },
+    ]
+    last_exc: Exception | None = None
+    for params in attempts:
+        try:
+            data = execute_tool("gmail_create_draft", params, identifier)
+            return data if isinstance(data, dict) else {}
+        except (ValueError, KeyError, TypeError) as exc:
+            last_exc = exc
+        except Exception as exc:
+            raise exc
+    if last_exc is not None:
+        raise last_exc
+    return {}
+
+
+def mark_read(identifier: str, message_id: str) -> None:
+    execute_tool(
+        "gmail_modify_message_labels",
+        {
+            "message_id": message_id,
+            "remove_label_ids": ["UNREAD"],
+        },
+        identifier,
+    )

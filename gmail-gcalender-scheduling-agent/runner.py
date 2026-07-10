@@ -1,193 +1,329 @@
-# runner.py
+# runner.py — Gmail Scheduling Agent poll loop
 
-from datetime import datetime, timedelta
+from __future__ import annotations
+import logging
 import os
+import re
+import sys
 import time
+from datetime import datetime, timedelta
+
 import pytz
-from sk_connectors import get_connector
-from gmail_api import fetch_emails, get_message
-from calendar_api import list_calendars, list_events, create_event
+
+from sk_connectors import ensure_connected
+from gmail_api import fetch_emails, get_message, create_draft, mark_read
+from calendar_api import get_primary_calendar_id, create_event, get_busy_slots
 from parsers import parse_entities
-from slotting import derive_busy, suggest_slots, human_slot, iso, overlaps
+from slotting import suggest_slots, human_slot, iso
 
-USER_TZ = os.getenv("USER_DEFAULT_TZ", "Asia/Kolkata")
-LOCAL_TZ = pytz.timezone(USER_TZ)
-WORK_START_LOCAL = os.getenv("WORK_START_LOCAL", "10:00")
-WORK_END_LOCAL = os.getenv("WORK_END_LOCAL", "18:00")
-DEFAULT_DURATION_MIN = int(os.getenv("DEFAULT_DURATION_MIN", "30"))
-BUFFER_MIN = int(os.getenv("BUFFER_MIN", "10"))
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-def hm_to_time(hm: str):
-    h, m = hm.split(":")
+ICONS = {
+    "poll":    "⌕",
+    "email":   "📧",
+    "cal":     "📅",
+    "done":    "✔",
+    "skip":    "–",
+    "warn":    "⚠",
+    "error":   "✖",
+    "llm":     "✦",
+    "draft":   "✉",
+    "banner":  "─",
+}
+
+CYAN  = "\033[36m"
+BOLD  = "\033[1m"
+WHITE = "\033[97m"
+GREY  = "\033[90m"
+RESET = "\033[0m"
+
+
+def _setup_logging() -> None:
+    level = os.getenv("LOG_LEVEL", "INFO").upper()
+    fmt = "%(asctime)s | %(levelname)-8s | %(message)s"
+    datefmt = "%H:%M:%S"
+    logging.basicConfig(level=getattr(logging, level, logging.INFO),
+                        format=fmt, datefmt=datefmt, stream=sys.stdout)
+    # Suppress noisy SDK internals
+    for noisy in ("httpx", "httpcore", "urllib3", "grpc"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+_setup_logging()
+log = logging.getLogger("scheduling-agent")
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+USER_TZ          = os.getenv("USER_DEFAULT_TZ", "Asia/Kolkata")
+LOCAL_TZ         = pytz.timezone(USER_TZ)
+WORK_START       = os.getenv("WORK_START_LOCAL", "10:00")
+WORK_END         = os.getenv("WORK_END_LOCAL", "18:00")
+DEFAULT_DURATION = int(os.getenv("DEFAULT_DURATION_MIN", "30"))
+BUFFER_MIN       = int(os.getenv("BUFFER_MIN", "10"))
+POLL_INTERVAL    = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
+IDENTIFIER       = os.getenv("SCALEKIT_IDENTIFIER", "")
+
+# Gmail search — catches plain-text scheduling requests AND .ics invites
+GMAIL_QUERY = (
+    "is:unread "
+    "(subject:(meeting OR sync OR call OR invite OR schedule OR \"let's meet\" OR \"catch up\") "
+    "OR body:(\"can we meet\" OR \"let's sync\" OR \"schedule a call\" OR \"set up a meeting\" "
+    "        OR \"book a time\" OR \"find a time\" OR \"calendar invite\") "
+    "OR has:attachment filename:ics)"
+)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _hm(hm_str: str):
+    h, m = hm_str.split(":")
     return datetime.strptime(f"{h}:{m}", "%H:%M").time()
 
-def _headers_dict(message):
+
+def _headers_dict(message: dict) -> dict:
     hdrs = {}
-    payload = message.get("payload", {})
-    for h in payload.get("headers", []):
-        name = h.get("name")
-        value = h.get("value")
-        if name:
-            hdrs[name] = value
+    for h in (message.get("payload") or {}).get("headers", []):
+        if h.get("name"):
+            hdrs[h["name"]] = h.get("value", "")
     return hdrs
 
-def _subject_from_message(message):
-    hdrs = _headers_dict(message)
-    return hdrs.get("Subject") or hdrs.get("subject") or message.get("subject") or "(no subject)"
 
-def _try_queries(connector, identifier, max_results=10):
-    # Only searching for meeting invites with .ics attachments
-    q = ('in:anywhere newer_than:1d '
-         '(subject:("Invitation:" OR "Updated invitation:" OR "Rescheduled") '
-         'OR body:("When" OR "Date" OR "Time" OR "Join with Google Meet")) '
-         'has:attachment filename:ics')
-    return fetch_emails(identifier, q, max_results=max_results) or []
+def _reply_to(headers: dict) -> str:
+    """Extract bare email address from Reply-To or From header."""
+    raw = headers.get("Reply-To") or headers.get("From") or ""
+    m = re.search(r"<([^>]+)>", raw)
+    return m.group(1).strip() if m else raw.strip()
 
-# Track processed event IDs
-processed_event_ids = set()
 
-def process_invitation(connector, identifier, msg):
-    msg_id = msg.get("id") or msg.get("messageId")
-    
-    # Skip if the event has already been processed
-    if msg_id in processed_event_ids:
-        print(f"Event {msg_id} already processed; skipping.")
+def _extract_body(message: dict) -> str:
+    """Walk Gmail payload parts and return decoded plain-text body."""
+    import base64
+
+    def _decode(data: str) -> str:
+        try:
+            return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    def _walk(part: dict) -> str:
+        mime = part.get("mimeType", "")
+        body_data = (part.get("body") or {}).get("data", "")
+        if mime == "text/plain" and body_data:
+            return _decode(body_data)
+        for sub in part.get("parts") or []:
+            text = _walk(sub)
+            if text:
+                return text
+        return ""
+
+    payload = message.get("payload") or {}
+    return _walk(payload)
+
+# ---------------------------------------------------------------------------
+# Banner
+# ---------------------------------------------------------------------------
+
+def _banner() -> None:
+    tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+    if not tty:
+        print("Gmail Scheduling Agent starting...")
         return
-    processed_event_ids.add(msg_id)
+    line = f"{CYAN}{BOLD}{'─' * 60}{RESET}"
+    print(line)
+    print(f"{CYAN}{BOLD}  Gmail Scheduling Agent{RESET}")
+    print(f"{GREY}  Watches Gmail and books Google Calendar events automatically{RESET}")
+    print(line)
+    masked = ("*" * 4 + IDENTIFIER[-4:]) if len(IDENTIFIER) > 4 else "****"
+    print(f"  {GREY}Identifier   :{RESET} {WHITE}{masked}{RESET}")
+    print(f"  {GREY}Timezone     :{RESET} {WHITE}{USER_TZ}{RESET}")
+    print(f"  {GREY}Work hours   :{RESET} {WHITE}{WORK_START} – {WORK_END}{RESET}")
+    print(f"  {GREY}Poll interval:{RESET} {WHITE}{POLL_INTERVAL}s{RESET}")
+    print(line)
+    print()
 
-    # Parse the invitation email
-    full = get_message(identifier, msg_id) or {}
+# ---------------------------------------------------------------------------
+# Core: process one email
+# ---------------------------------------------------------------------------
+
+def process_message(identifier: str, msg_stub: dict, processed: set) -> bool:
+    msg_id = msg_stub.get("id")
+    if not msg_id or msg_id in processed:
+        return False
+
+    full = get_message(identifier, msg_id)
+    if not full:
+        log.warning("%s  Could not fetch message %s", ICONS["warn"], msg_id)
+        return False
+
     headers = _headers_dict(full)
-    subject = _subject_from_message(full)
-    body = full.get("snippet") or ""
-    
-    # Parse entities from the email (hard start, attendees, etc.)
-    ent = parse_entities(subject, body, headers, user_tz=USER_TZ, default_duration=DEFAULT_DURATION_MIN)
-    
-    if not ent.hard_start:
-        print(f"No hard date/time found in message {msg_id}; skipping.")
-        return
-    
-    # Retrieve calendar events
-    cals_resp = list_calendars(identifier) or {}
-    cals = cals_resp.get("calendars", [])
-    if not cals:
-        print("No calendars accessible. Skip.")
-        return
-    
-    cal_id = next((c.get("id") for c in cals if str(c.get("primary")).lower() == "true"), cals[0].get("id"))
+    subject = next(
+        (h["value"] for h in (full.get("payload") or {}).get("headers", [])
+         if h.get("name") == "Subject"), ""
+    ) or "(no subject)"
+    body = _extract_body(full)
+    if not body:
+        body = full.get("snippet") or ""
 
-    # Get existing events for conflict check
+    log.info("%s  %s", ICONS["email"], subject[:80])
+
+    # LLM extracts intent, datetime, attendees
+    log.debug("%s  Parsing email for scheduling intent...", ICONS["llm"])
+    ent = parse_entities(subject, body, headers, user_tz=USER_TZ, default_duration=DEFAULT_DURATION)
+
+    # LLM returned no scheduling intent at all (is_scheduling=false)
+    if not ent.hard_start and not ent.title:
+        log.info("%s  No scheduling intent found — skipping", ICONS["skip"])
+        try:
+            mark_read(identifier, msg_id)
+        except Exception as exc:
+            log.warning("%s  Could not mark message %s as read: %s",
+                        ICONS["warn"], msg_id, exc)
+        processed.add(msg_id)
+        return False
+
+    cal_id = get_primary_calendar_id(identifier)
     now = datetime.now(LOCAL_TZ)
-    time_min = iso(now)
-    time_max = iso(now + timedelta(days=30))
-    events_resp = list_events(identifier, cal_id, time_min, time_max) or {}
-    events = events_resp.get('events', []) if isinstance(events_resp, dict) else events_resp
-    
-    # If no events, treat as no busy blocks
-    if not events:
-        busy = []
+    busy = get_busy_slots(identifier, iso(now - timedelta(days=1)),
+                          iso(now + timedelta(days=30)), LOCAL_TZ)
+    log.debug("%s  %d busy block(s) on calendar", ICONS["cal"], len(busy))
+
+    if ent.hard_start:
+        log.info("%s  Intent: '%s' | %s | %dmin",
+                 ICONS["cal"], ent.title,
+                 ent.hard_start.strftime("%a %b %d %H:%M %Z"),
+                 ent.duration_minutes)
+        proposed_start = ent.hard_start.astimezone(LOCAL_TZ)
+        proposed_end = (
+            ent.hard_end.astimezone(LOCAL_TZ) if ent.hard_end
+            else proposed_start + timedelta(minutes=ent.duration_minutes)
+        )
+        conflict = any(proposed_start < b1 and proposed_end > b0 for b0, b1 in busy)
     else:
-        busy = derive_busy(events, LOCAL_TZ)
-    print("busy slots generated:", busy)
-    
-    # Propose event times
-    proposed_start = ent.hard_start.astimezone(LOCAL_TZ)
-    proposed_end = ent.hard_end.astimezone(LOCAL_TZ) if ent.hard_end else proposed_start + timedelta(minutes=ent.duration_minutes)
-    
-    conflict = False
-    for b0, b1 in busy:
-        if overlaps(proposed_start, proposed_end, b0, b1):
-            print("Conflict detected!")
-            conflict = True
-            break
-    
-    if not conflict:
-        # No conflict: create the event at the proposed time
-        print(f"No conflict for {subject}; creating event at proposed time.")
-        payload = {
-            "calendarId": cal_id,
-            "summary": ent.title,
-            "description": f"Scheduled from email (message_id={msg_id}).",
-            "start": {"dateTime": iso(proposed_start), "timeZone": USER_TZ},
-            "end": {"dateTime": iso(proposed_end), "timeZone": USER_TZ},
-            "attendees": [a.model_dump() for a in ent.attendees],
-            "conferenceData": {"createRequest": {"requestId": f"req-{int(now.timestamp())}"}},
-            "sendUpdates": "all"
-        }
-        resp = create_event(identifier, cal_id, payload)
-        if "error" in resp:
-            print("Failed to create event:", resp["error"])
-        else:
-            print("Event created at proposed time.")
-            processed_event_ids.add(msg_id)
-        return
+        # Flex scheduling request ("can we meet this week?") — find next free slot
+        log.info("%s  Flex scheduling intent: '%s' | %dmin — finding slot",
+                 ICONS["cal"], ent.title, ent.duration_minutes)
+        conflict = True  # force slot suggestion path
 
-    # Conflict exists: find available time slots
-    print(f"Conflict for {subject}; proposing alternatives.")
-    # Respect original meeting duration if available
-    resched_duration_min = ent.duration_minutes
-    try:
-        if ent.hard_start and ent.hard_end:
-            resched_duration_min = max(1, int((ent.hard_end - ent.hard_start).total_seconds() // 60))
-    except Exception:
-        pass
-    free_slots = suggest_slots(
-        busy=busy, now_local=now, 
-        work_start=hm_to_time(WORK_START_LOCAL),
-        work_end=hm_to_time(WORK_END_LOCAL),
-        duration_min=resched_duration_min,
-        buffer_min=BUFFER_MIN,
-        days_ahead=7, limit=3
-    )
-    
-    if not free_slots:
-        print("No available slots in next week.")
-        return
+    if conflict:
+        log.info("%s  Conflict at proposed time — finding alternatives", ICONS["warn"])
+        free_slots = suggest_slots(
+            busy=busy, now_local=now,
+            work_start=_hm(WORK_START), work_end=_hm(WORK_END),
+            duration_min=ent.duration_minutes, buffer_min=BUFFER_MIN,
+            days_ahead=7, limit=3,
+        )
+        if not free_slots:
+            log.warning("%s  No free slots in next 7 days — skipping", ICONS["warn"])
+            processed.add(msg_id)
+            return False
+        proposed_start, proposed_end = free_slots[0]
+        log.info("%s  Rescheduled → %s", ICONS["cal"], human_slot(free_slots[0], USER_TZ))
 
-    # Choose first available slot and create event
-    chosen_slot = free_slots[0]
-    print(f"Proposed slot: {human_slot(chosen_slot, USER_TZ)}")
-
-    payload = {
-        "calendarId": cal_id,
+    # Create calendar event
+    event_payload = {
         "summary": ent.title,
-        "description": f"Rescheduled from email (message_id={msg_id}).",
-        "start": {"dateTime": iso(chosen_slot[0]), "timeZone": USER_TZ},
-        "end": {"dateTime": iso(chosen_slot[1]), "timeZone": USER_TZ},
+        "start":   {"dateTime": iso(proposed_start), "timeZone": USER_TZ},
+        "end":     {"dateTime": iso(proposed_end),   "timeZone": USER_TZ},
         "attendees": [a.model_dump() for a in ent.attendees],
-        "conferenceData": {"createRequest": {"requestId": f"req-{int(now.timestamp())}"}},
-        "sendUpdates": "all"
+        "sendUpdates": "all",
     }
+    result = create_event(identifier, cal_id, event_payload)
 
-    resp = create_event(identifier, cal_id, payload)
-    if "error" in resp:
-        print("Failed to create event:", resp["error"])
-    else:
-        print("Rescheduled invite. New event created.")
-        processed_event_ids.add(msg_id)  # Mark this event as processed
+    if "error" in result:
+        log.error("%s  Event creation failed: %s", ICONS["error"], result["error"])
+        processed.add(msg_id)
+        return False
 
+    event_link = result.get("htmlLink", "")
+    log.info("%s  Event created: %s", ICONS["done"], event_link or "(no link)")
 
-def main():
-    connector = get_connector()
-    identifier = connector.get_user_identifier()
-    if not identifier:
-        print("Set SCALEKIT_IDENTIFIER in .env")
-        return
+    # Save confirmation draft
+    reply_to = _reply_to(headers)
+    if reply_to:
+        slot_str = human_slot((proposed_start, proposed_end), USER_TZ)
+        draft_body = (
+            "Hi,\n\n"
+            f"I've scheduled '{ent.title}' for {slot_str}.\n"
+            "A calendar invite has been sent to all attendees.\n"
+            + (f"\nEvent: {event_link}\n" if event_link else "")
+            + "\nBest regards"
+        )
+        draft_subject = f"Re: {subject}"[:100]
+        try:
+            draft = create_draft(identifier, to=reply_to,
+                                 subject=draft_subject, body=draft_body)
+            log.info("%s  Confirmation draft saved (id=%s)",
+                     ICONS["draft"], draft.get("id", "?"))
+        except Exception as exc:
+            log.warning("%s  Draft creation failed for message %s: %s",
+                        ICONS["warn"], msg_id, exc)
 
-    processed_msgs = set()
+    try:
+        mark_read(identifier, msg_id)
+    except Exception as exc:
+        log.warning("%s  Could not mark message %s as read: %s",
+                    ICONS["warn"], msg_id, exc)
+    processed.add(msg_id)
+    log.info("%s  Message %s done", ICONS["done"], msg_id)
+    return True
+
+# ---------------------------------------------------------------------------
+# Poll loop
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    _banner()
+
+    if not IDENTIFIER:
+        log.error("%s  SCALEKIT_IDENTIFIER not set in .env", ICONS["error"])
+        sys.exit(1)
+
+    log.info("Checking Scalekit connections...")
+    ensure_connected("gmail", IDENTIFIER)
+    ensure_connected("googlecalendar", IDENTIFIER)
+    log.info("%s  Both connections active", ICONS["done"])
+
+    processed: set = set()
+    consecutive_errors = 0
+
     while True:
-        msgs = _try_queries(connector, identifier, max_results=10)
-        if msgs:
-            # Sort newest to oldest by internalDate (string of epoch ms)
-            msgs.sort(key=lambda x: int(x.get("internalDate", "0")), reverse=True)
-            for m in msgs:
-                msg_id = m.get("id") or m.get("messageId")
-                if msg_id in processed_msgs:
-                    continue
-                process_invitation(connector, identifier, m)
-                processed_msgs.add(msg_id)
-        time.sleep(60)  # Poll every minute
+        try:
+            log.info("%s  Polling Gmail for scheduling emails...", ICONS["poll"])
+            msgs = fetch_emails(IDENTIFIER, GMAIL_QUERY, max_results=10)
+
+            if msgs:
+                log.info("%s  Found %d unread email(s) to process", ICONS["poll"], len(msgs))
+                done = 0
+                for m in msgs:
+                    try:
+                        if process_message(IDENTIFIER, m, processed):
+                            done += 1
+                    except Exception as msg_exc:
+                        log.error("%s  Failed processing message %s: %s",
+                                  ICONS["error"], m.get("id", "?"), msg_exc)
+                log.info("%s  Poll complete — processed=%d skipped=%d",
+                         ICONS["done"], done, len(msgs) - done)
+            else:
+                log.info("%s  No new scheduling emails", ICONS["skip"])
+
+            consecutive_errors = 0
+
+        except Exception as exc:
+            consecutive_errors += 1
+            log.error("%s  Poll error (%d consecutive): %s",
+                      ICONS["error"], consecutive_errors, exc)
+            if consecutive_errors >= 5:
+                log.error("%s  5 consecutive errors — check connectivity and credentials",
+                          ICONS["error"])
+
+        log.info("%s  Next poll in %ds...", ICONS["poll"], POLL_INTERVAL)
+        time.sleep(POLL_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
