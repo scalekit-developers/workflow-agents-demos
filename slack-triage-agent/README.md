@@ -1,123 +1,292 @@
-# Slack Triage Agent (Scalekit + LangGraph)
+---
+sample_type: sample-app
+---
 
-![Slack Triage Agent](assets/Slack%20Triage%20Agent.png)
+# Slack Triage Agent
 
-## Get Started (5 steps)
+> Automatically triage Slack messages into GitHub issues or Zendesk tickets using [Scalekit](https://scalekit.com) and [LangGraph](https://langchain-ai.github.io/langgraph/) — no webhook servers, no token management.
 
-1. Create a virtual environment and install deps
+This agent polls Slack for new messages, classifies them based on keywords, and creates GitHub issues or Zendesk tickets accordingly. All third-party calls go through Scalekit's connected-accounts API so you never handle OAuth tokens directly.
+
+---
+
+## What It Does
+
+| Step | Action |
+|------|--------|
+| Poll | Fetch messages from Slack every 30 seconds |
+| Classify | Detect keywords: bug → GitHub, support → Zendesk |
+| Route | Determine target action based on message content |
+| Execute | Create GitHub issue or Zendesk ticket |
+| Reply | Post confirmation in Slack thread |
+
+---
+
+## Architecture
+
+```mermaid
+graph TD
+    A["Slack Workspace<br/>(C1234567890A)"] -->|monitor| B["Polling Agent<br/>(30s intervals)"]
+    
+    B -->|fetch| C["Slack Bot<br/>(slack-xxxxx)"]
+    C -->|OAuth Token| D["Scalekit Vault<br/>(Secure Storage)"]
+    
+    B -->|route| E["Message Router"]
+    E -->|keyword match| F["Rule-Based<br/>Router"]
+    
+    F -->|bug| H["GitHub Action"]
+    F -->|feature| H
+    F -->|support| I["Zendesk Action"]
+    
+    H -->|create issue| J["GitHub Repo"]
+    I -->|create ticket| K["Zendesk Account"]
+    
+    H -->|reply| C
+    I -->|reply| C
+    C -->|post| A
+    
+    style A fill:#36c5f0
+    style B fill:#2ecc71
+    style C fill:#f39c12
+    style D fill:#e74c3c
+    style E fill:#9b59b6
+    style F fill:#3498db
+    style H fill:#16a085
+    style I fill:#16a085
+    style J fill:#34495e
+    style K fill:#34495e
+```
+
+**Tools used via Scalekit Actions:**
+- `slack_fetch_conversation_history` — list new messages
+- `github_issue_create` — create GitHub issues
+- `zendesk_create_ticket` — create Zendesk tickets (when configured)
+- `slack_send_message` — post confirmation replies
+
+**File map:**
+
+```text
+main_polling.py       Main polling loop + message processing
+sk_connectors.py      Scalekit API integration layer
+actions.py            GitHub, Zendesk, Slack action handlers
+routing.py            Message classification (keyword-based)
+settings.py           Environment variable management
+logging_config.py     Structured logging configuration
+user_mapping.json     Slack user → Scalekit identifier mapping
+```
+
+---
+
+## Prerequisites
+
+- Python 3.10+
+- A [Scalekit](https://scalekit.com) account with Slack and GitHub connections configured
+- Your Scalekit environment URL, client ID, and client secret
+- Slack channel ID to monitor
+- GitHub repository (owner/name) to create issues in
+- (Optional) Zendesk connector configured in Scalekit
+
+---
+
+## Quick Start
+
+### 1. Clone and set up the environment
 
 ```bash
+git clone https://github.com/scalekit-developers/workflow-agents-demos
+cd workflow-agents-demos/slack-triage-agent
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Optional (Windows PowerShell):
+### 2. Configure environment variables
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+```bash
+cp .env.example .env
 ```
 
-2. Create .env from the example and fill the required values
+Edit `.env`:
 
 ```env
-# Required
-SCALEKIT_ENV_URL=https://hey.scalekit.dev
-SCALEKIT_CLIENT_ID=your_client_id
-SCALEKIT_CLIENT_SECRET=your_client_secret
-ALLOWED_CHANNELS=C09JTJWN0R3     # Comma-separated Slack channel IDs
+# Scalekit credentials (from app.scalekit.com)
+SCALEKIT_ENV_URL=https://api.example.scalekit.com
+SCALEKIT_CLIENT_ID=skc_abcd1234xyz
+SCALEKIT_CLIENT_SECRET=test_xxxxx
 
-# GitHub repo to create issues in
-GITHUB_REPO_OWNER=your_github_username
-GITHUB_REPO_NAME=your_repo
+# Scalekit connector names
+SCALEKIT_SLACK_CONNECTION=slack-xxxxx
+SCALEKIT_GITHUB_CONNECTION=github-xxxxx
 
-# Optional
-POLL_INTERVAL_SECONDS=30
-POLL_LOOKBACK_SECONDS=86400
+# Channel to monitor
+ALLOWED_CHANNELS=C1234567890A
+
+# GitHub target
+GITHUB_REPO_OWNER=demo-user
+GITHUB_REPO_NAME=demo-repo
+
+# (Optional) Zendesk
+# SCALEKIT_ZENDESK_CONNECTION=zendesk
 ```
 
-3. Map your Slack user to a Scalekit identifier (copy the example first)
+### 3. Map Slack users
 
-```bash
-cp user_mapping.example.json user_mapping.json
-```
-
-Then edit `user_mapping.json`:
+Edit `user_mapping.json`:
 
 ```json
 {
-  "U01234567": {
-    "scalekit_identifier": "you@company.com",
-    "github_username": "your-github"
+  "U1234567890A": {
+    "scalekit_identifier": "user@example.com",
+    "slack_username": "Demo User",
+    "github_username": "demo-user"
   }
 }
 ```
 
-4. Start the agent
+Find your Slack user ID: Profile → "..." menu → Copy member ID
+
+### 4. Run the agent
 
 ```bash
 python main_polling.py
 ```
 
-5. Authorize Slack and GitHub (replace with your Slack user ID)
+### 5. Test
+
+Post a message to your monitored Slack channel:
 
 ```text
-http://localhost:5000/auth/init?user_id=YOUR_SLACK_USER_ID&service=slack
-http://localhost:5000/auth/init?user_id=YOUR_SLACK_USER_ID&service=github
+bug: Login button not working on mobile
 ```
 
-Tip: YOUR_SLACK_USER_ID is the key you used in user_mapping.json (e.g., U01234567).
+Agent will:
+- Detect "bug" keyword
+- Create GitHub issue
+- Reply in Slack thread with link
 
-### What is YOUR_SLACK_USER_ID?
+---
 
-- It's your Slack Member ID, a string like `U01234567`. In this project, it's the key in `user_mapping.json`.
-- How to find it:
-  - Slack desktop: Open your profile → three dots (More) → Copy member ID.
-  - Or right‑click your name in a message → View profile → three dots → Copy member ID.
-  - It will be used in the OAuth URLs and as the key in `user_mapping.json`.
+## Message Routing
 
-Then post in Slack:
+Messages are classified and routed based on keywords:
 
-```text
-bug: The login page is broken
+| Keyword | Action | Destination | Requires |
+|---------|--------|-------------|----------|
+| bug, issue, broken, error, crash | Create issue | GitHub | SCALEKIT_GITHUB_CONNECTION |
+| feature, request, add, enhancement | Create issue | GitHub | SCALEKIT_GITHUB_CONNECTION |
+| support, help, question, how | Create ticket | Zendesk | SCALEKIT_ZENDESK_CONNECTION |
+| Other text | Ignore | — | — |
+
+---
+
+## Message Processing Guarantees
+
+- **No duplicates within a session**: Messages tracked in-memory by timestamp; restarting the agent will re-process older messages
+- **No feedback loops**: Bot replies filtered by `bot_id` field
+- **No thread recursion**: Thread replies (messages with `thread_ts != ts`) are ignored
+
+---
+
+## Configuration Reference
+
+### Environment Variables
+
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
+| SCALEKIT_ENV_URL | Yes | — | Scalekit environment URL |
+| SCALEKIT_CLIENT_ID | Yes | — | Scalekit client ID |
+| SCALEKIT_CLIENT_SECRET | Yes | — | Scalekit client secret |
+| SCALEKIT_SLACK_CONNECTION | Yes | — | Slack connector name in Scalekit |
+| SCALEKIT_GITHUB_CONNECTION | Yes | — | GitHub connector name in Scalekit |
+| SCALEKIT_ZENDESK_CONNECTION | No | — | Zendesk connector name (required for support routing) |
+| ALLOWED_CHANNELS | Yes | — | Slack channel IDs to monitor |
+| GITHUB_REPO_OWNER | Yes | — | GitHub username |
+| GITHUB_REPO_NAME | Yes | — | GitHub repository name |
+| POLL_INTERVAL_SECONDS | No | 30 | Polling interval in seconds |
+| POLL_LOOKBACK_SECONDS | No | 86400 | Message history window (24h) |
+| OPENAI_API_KEY | No | — | For LLM-based routing |
+| OPENAI_MODEL | No | gpt-4 | LLM model |
+| LOG_LEVEL | No | DEBUG | Logging level |
+| FLASK_PORT | No | 5000 | Health endpoint port |
+
+---
+
+## Security
+
+- **OAuth tokens**: Managed entirely by Scalekit vault — never stored in code
+- **Environment variables**: Use `.env` file, never commit to git
+- **Logging**: Secrets redacted automatically in logs
+
+---
+
+## Troubleshooting
+
+| Problem | Cause | Solution |
+|---------|-------|----------|
+| Message not detected | Channel ID incorrect or message older than 24h | Verify `ALLOWED_CHANNELS`, post fresh message |
+| Message not in user_mapping.json | Slack user ID not mapped | Add user ID to `user_mapping.json` |
+| GitHub issue not created | GitHub connector not ACTIVE | Check Scalekit dashboard: github connector status |
+| Duplicate GitHub issues | Should not happen | If it does: check logs, restart agent |
+| "Address already in use" (Port 5000) | Flask port in use | Change `FLASK_PORT` in `.env` or stop other process |
+| "connected account is not active" | OAuth not completed | Authorize connector in Scalekit dashboard |
+| No messages in logs | Agent not running | Check: `python main_polling.py` is running |
+| "No mapping found for Slack user" | User not in user_mapping.json | Add user ID and scalekit_identifier |
+| Zendesk tickets not created | Zendesk connector not configured | See [ZENDESK_SETUP.md](ZENDESK_SETUP.md) |
+| Slack replies not sent | Slack connector status PENDING_AUTH | Complete OAuth in Scalekit dashboard |
+
+---
+
+## Logging
+
+Agent logs all major events. Monitor with:
+
+```bash
+# Watch real-time logs
+python main_polling.py | grep -E "INFO|ERROR|DEBUG"
+
+# Check specific action
+python main_polling.py 2>&1 | grep "github_issue"
 ```
 
-The agent will create a GitHub issue and reply in Slack with a confirmation.
+### Log Levels
 
-## How it works (short)
+- `DEBUG`: Polling cycles, message processing steps
+- `INFO`: Messages detected, actions executed, issues created
+- `WARNING`: Non-fatal issues
+- `ERROR`: Failures (action execution, API calls)
 
-- `main_polling.py` polls Slack via Scalekit, filters bot/duplicate messages
-- `routing.py` decides: GitHub issue, Zendesk ticket (placeholder), or ignore (keyword-based)
-- `actions.py` performs actions (GitHub issue, Slack confirmation)
-- `sk_connectors.py` wraps Scalekit API calls with retries
+---
 
-Note: Zendesk is currently not supported in Scalekit for this app. Routing includes a Zendesk placeholder but only GitHub is executed.
+## Graceful Shutdown
 
-Keywords (edit in `settings.py`):
+Stop the agent cleanly:
 
-```python
-GITHUB_KEYWORDS = ["bug", "error", "github:", "issue:", "broken", "crash", "exception"]
-ZENDESK_KEYWORDS = ["support", "help", "zendesk:", "ticket:", "customer", "billing", "question"]  # placeholder
+```bash
+Ctrl+C
 ```
 
-## Files at a glance
+Agent will:
+1. Set shutdown flag
+2. Finish current polling cycle
+3. Close connections
+4. Exit with code 130
 
-- `main_polling.py` – polling loop and OAuth endpoints
-- `routing.py` – LangGraph workflow for analyze → execute → confirm
-- `actions.py` – GitHub issue creation + Slack confirmations
-- `sk_connectors.py` – Scalekit client + retries + connection checks
-- `settings.py` – config, channel lists, keywords, polling intervals
-- `user_mapping.json` – Slack user → {scalekit identifier, github username}
+Response time: ~1 second
 
-## Quick troubleshooting
+---
 
-- No messages fetched → authorize Slack using the URL above
-- GitHub issue fails → check repo owner/name and GitHub authorization
-- "User not mapped" → add your Slack user to `user_mapping.json`
+## Dependencies
 
-**Learn more:**
+| Package | Version | Purpose |
+|---------|---------|---------|
+| scalekit-sdk-python | 2.12.0+ | OAuth & Actions API |
+| langgraph | 0.1+ | Message routing graph |
+| flask | 3.0+ | Health endpoint |
+| langchain | 0.2+ | LLM integration |
+| python-dotenv | 1.1+ | .env loading |
+| colorama | 0.4.6+ | Colored terminal output |
 
-- [Scalekit Blog for this project](https://www.scalekit.com/blog)
-- [Agent Actions Quickstart Docs](https://docs.scalekit.com/agent-actions/quickstart/)
+See `requirements.txt` for complete list.
+
+---
+

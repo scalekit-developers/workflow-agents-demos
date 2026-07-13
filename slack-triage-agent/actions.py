@@ -94,14 +94,6 @@ class Actions:
                 error="GITHUB_REPO_OWNER and GITHUB_REPO_NAME must be set"
             )
 
-        # Check if user has GitHub connected
-        if not self.connector.is_service_connected("github", user_identifier):
-            return ActionResult(
-                success=False,
-                message="GitHub not connected for this user",
-                error="User needs to authorize GitHub via OAuth"
-            )
-
         # Prepare parameters for Scalekit action
         # These match the github_issue_create tool schema
         parameters = {
@@ -116,9 +108,11 @@ class Actions:
             parameters["labels"] = labels
 
         # Execute action with retry logic
+        # Use Settings.SCALEKIT_GITHUB_CONNECTION to specify which GitHub connector to use
         result = self.connector.execute_action_with_retry(
             identifier=user_identifier,
             tool="github_issue_create",
+            connection_name=Settings.SCALEKIT_GITHUB_CONNECTION,
             parameters=parameters
         )
 
@@ -156,12 +150,69 @@ class Actions:
         ticket_type: str = "question",
         tags: Optional[list] = None
     ) -> ActionResult:
-        """Create a Zendesk support ticket. (Not supported - Scalekit doesn't have Zendesk yet)"""
-        return ActionResult(
-            success=False,
-            message="Zendesk integration not available",
-            error="Zendesk is not currently supported by Scalekit"
+        """
+        Create a Zendesk support ticket.
+
+        Args:
+            user_identifier: User's Scalekit identifier
+            subject: Ticket subject (brief summary)
+            description: Ticket description (detailed info)
+            priority: Priority level (low, normal, high, urgent)
+            ticket_type: Ticket type (question, incident, problem, task)
+            tags: Optional list of tags to apply
+
+        Returns:
+            ActionResult with ticket details or error
+        """
+        # Check if Zendesk is configured
+        if not Settings.SCALEKIT_ZENDESK_CONNECTION:
+            return ActionResult(
+                success=False,
+                message="Zendesk not configured",
+                error="SCALEKIT_ZENDESK_CONNECTION must be set in .env"
+            )
+
+        # Prepare parameters for Scalekit action
+        parameters = {
+            "subject": subject,
+            "description": description,
+            "priority": priority,
+            "type": ticket_type,
+        }
+
+        # Add tags if provided
+        if tags:
+            parameters["tags"] = tags
+
+        # Execute action with retry logic
+        # Use Settings.SCALEKIT_ZENDESK_CONNECTION to specify which Zendesk connector to use
+        result = self.connector.execute_action_with_retry(
+            identifier=user_identifier,
+            tool="zendesk_create_ticket",
+            connection_name=Settings.SCALEKIT_ZENDESK_CONNECTION,
+            parameters=parameters
         )
+
+        if result:
+            # Extract ticket details from response
+            ticket_id = result.get("id", "unknown")
+            ticket_url = result.get("url", "")
+
+            return ActionResult(
+                success=True,
+                message=f"Zendesk ticket #{ticket_id} created",
+                data={
+                    "ticket_id": ticket_id,
+                    "ticket_url": ticket_url,
+                    "priority": priority,
+                }
+            )
+        else:
+            return ActionResult(
+                success=False,
+                message="Failed to create Zendesk ticket",
+                error="Scalekit action execution failed"
+            )
 
     # ============================================================================
     # SLACK ACTIONS
@@ -188,16 +239,6 @@ class Actions:
         Returns:
             ActionResult with message details or error
         """
-        # Check if user has Slack connected
-        # Note: The bot itself likely has Slack access, but we use Scalekit
-        # for consistency and to respect user-level permissions
-        if not self.connector.is_service_connected("slack", user_identifier):
-            return ActionResult(
-                success=False,
-                message="Slack not connected for this user",
-                error="User needs to authorize Slack via OAuth"
-            )
-
         # Prepare parameters for Scalekit action
         parameters = {
             "channel": channel_id,
@@ -209,9 +250,11 @@ class Actions:
             parameters["thread_ts"] = thread_ts
 
         # Execute action with retry logic
+        # Use Settings.SCALEKIT_SLACK_CONNECTION to specify which Slack connector to use
         result = self.connector.execute_action_with_retry(
             identifier=user_identifier,
             tool="slack_send_message",
+            connection_name=Settings.SCALEKIT_SLACK_CONNECTION,
             parameters=parameters
         )
 

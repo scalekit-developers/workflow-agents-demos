@@ -156,12 +156,19 @@ class ScalekitConnector:
                     status = getattr(connection, "status", None)
 
                 # Case-insensitive comparison (API returns "GITHUB", we search for "github")
-                if provider and provider.upper() == service.upper() and status and status.upper() == "ACTIVE":
-                    print(f"✅ Found active {service} connection for {user_identifier}")
-                    return connection
+                if provider and provider.upper() == service.upper():
+                    if status and status.upper() == "ACTIVE":
+                        print(f"✅ Found active {service} connection for {user_identifier}")
+                        return connection
+                    elif status and status.upper() == "PENDING_AUTH":
+                        connector_name = getattr(connection, 'connector', 'unknown')
+                        print(f"⚠️  {service.upper()} connection is PENDING_AUTH (not fully authorized)")
+                        print(f"   Connector: {connector_name}")
+                        print(f"   Run: python get_auth_links.py")
+                        return None
 
-            print(f"⚠️  No active {service} connection for {user_identifier}")
-            print(f"   User needs to authorize via OAuth flow")
+            print(f"⚠️  No {service} connection found for {user_identifier}")
+            print(f"   Run: python get_auth_links.py")
             return None
 
         except ScalekitException as e:
@@ -185,7 +192,8 @@ class ScalekitConnector:
         self,
         identifier: str,
         tool: str,
-        parameters: Dict[str, Any],
+        connection_name: Optional[str] = None,
+        parameters: Dict[str, Any] = None,
         max_attempts: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
         """
@@ -204,12 +212,15 @@ class ScalekitConnector:
         Args:
             identifier: User's Scalekit identifier
             tool: Tool name (e.g., "github_issue_create")
+            connection_name: Connection name (optional, for disambiguating multiple connectors)
             parameters: Tool-specific parameters
             max_attempts: Maximum retry attempts (defaults to Settings.RETRY_ATTEMPTS)
 
         Returns:
             Action result on success, None on failure
         """
+        if parameters is None:
+            parameters = {}
         if max_attempts is None:
             max_attempts = Settings.RETRY_ATTEMPTS
 
@@ -220,13 +231,26 @@ class ScalekitConnector:
                 print(f"🔄 Executing {tool} (attempt {attempt}/{max_attempts})")
                 print(f"   Parameters: {self._sanitize_params(parameters)}")
 
+                # Get or create connected account if connection_name provided
+                account_id = None
+                if connection_name:
+                    resp = self.client.actions.get_or_create_connected_account(
+                        connection_name=connection_name,
+                        identifier=identifier,
+                    )
+                    account_id = resp.connected_account.id
+
                 # Execute the action via Scalekit's unified API
                 # Scalekit handles OAuth, API calls, and response parsing
-                response = self.client.actions.execute_tool(
-                    tool_input=parameters,
-                    tool_name=tool,
-                    identifier=identifier
-                )
+                kwargs = {
+                    'tool_input': parameters,
+                    'tool_name': tool,
+                    'identifier': identifier
+                }
+                if account_id:
+                    kwargs['connected_account_id'] = account_id
+
+                response = self.client.actions.execute_tool(**kwargs)
 
                 print(f"✅ Action {tool} succeeded")
                 # Return the data dict from the ExecuteToolResponse
