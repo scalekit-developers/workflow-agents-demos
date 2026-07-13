@@ -39,6 +39,17 @@ class Settings:
     SCALEKIT_CLIENT_SECRET: str = os.getenv("SCALEKIT_CLIENT_SECRET", "")
 
     # ============================================================================
+    # SCALEKIT CONNECTION NAMES (Configurable)
+    # ============================================================================
+
+    # Scalekit connector names for different services
+    # These must match the connector names configured in your Scalekit dashboard
+    # You can have multiple connectors for the same service (e.g., slack-prod, slack-staging)
+    SCALEKIT_SLACK_CONNECTION: str = os.getenv("SCALEKIT_SLACK_CONNECTION", "slack-sKfekCVz")
+    SCALEKIT_GITHUB_CONNECTION: str = os.getenv("SCALEKIT_GITHUB_CONNECTION", "github-g0DJbhbx")
+    SCALEKIT_ZENDESK_CONNECTION: str = os.getenv("SCALEKIT_ZENDESK_CONNECTION", "zendesk")
+
+    # ============================================================================
     # SLACK CONFIGURATION
     # ============================================================================
 
