@@ -46,9 +46,6 @@ def _signal_handler(sig, frame):
     logger.warning("Received signal, shutting down gracefully...")
     _shutdown_requested = True
 
-signal.signal(signal.SIGINT, _signal_handler)
-signal.signal(signal.SIGTERM, _signal_handler)
-
 # Initialize Flask app for health checks and auth endpoints
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
@@ -126,15 +123,15 @@ def get_slack_identifier(user_id: str, user_mappings: Dict) -> Optional[str]:
 
 def fetch_channel_messages(channel_id: str, identifier: str, limit: int = 10) -> List[Dict]:
     """
-    Fetch recent messages from a Slack channel via Scalekit.
+    Fetch recent messages from a Slack channel via Scalekit, including all paginated pages.
 
     Args:
         channel_id: Slack channel ID
         identifier: Scalekit user identifier
-        limit: Number of messages to fetch
+        limit: Number of messages per page to fetch
 
     Returns:
-        List of message dictionaries
+        List of message dictionaries (all pages combined)
     """
     try:
         # Use last poll time if available, otherwise use lookback period
@@ -153,49 +150,86 @@ def fetch_channel_messages(channel_id: str, identifier: str, limit: int = 10) ->
             logger.error("Connector not initialized")
             return []
 
-        result = connector.execute_action_with_retry(
-            identifier=identifier,
-            tool='slack_fetch_conversation_history',
-            connection_name=Settings.SCALEKIT_SLACK_CONNECTION,
-            parameters={
+        all_messages = []
+        cursor = None
+        page_count = 0
+
+        # Paginate through all available messages
+        while True:
+            page_count += 1
+            params = {
                 'channel': channel_id,
                 'limit': limit,
                 'oldest': str(oldest_time)
             }
-        )
+            if cursor:
+                params['cursor'] = cursor
 
-        if not result:
-            logger.debug(f"No result from Slack fetch for {channel_id}")
-            return []
+            result = connector.execute_action_with_retry(
+                identifier=identifier,
+                tool='slack_fetch_conversation_history',
+                connection_name=Settings.SCALEKIT_SLACK_CONNECTION,
+                parameters=params
+            )
 
-        # Result from Scalekit is an ExecuteToolResponse object
-        # The actual data is in result.data dictionary
-        messages = []
-        if hasattr(result, 'data') and isinstance(result.data, dict):
-            messages = result.data.get('messages', [])
-        elif isinstance(result, dict):
-            messages = result.get('messages', [])
+            if not result:
+                logger.debug(f"No result from Slack fetch page {page_count} for {channel_id}")
+                break
 
-        if messages:
-            logger.info(f"Fetched {len(messages)} messages from {channel_id}")
+            # Extract messages from result
+            messages = []
+            if hasattr(result, 'data') and isinstance(result.data, dict):
+                messages = result.data.get('messages', [])
+            elif isinstance(result, dict):
+                messages = result.get('messages', [])
 
-        # Update last poll boundary for the next fetch.
-        # If we received messages, move the boundary to the newest message ts (minus a small overlap)
-        if messages:
-            try:
-                max_ts = max(float(m.get('ts')) for m in messages if m.get('ts'))
-                last_poll_time[channel_id] = max_ts - float(Settings.POLL_OVERLAP_SECONDS)
-                readable_next = datetime.fromtimestamp(last_poll_time[channel_id]).strftime('%Y-%m-%d %H:%M:%S')
-                logger.debug(f"Next poll for {channel_id} will start at {readable_next}")
-            except Exception as e:
-                logger.debug(f"Error updating poll boundary: {e}, using current time")
-                last_poll_time[channel_id] = time.time() - float(Settings.POLL_OVERLAP_SECONDS)
-        else:
-            # No messages returned: keep a small overlap to avoid racing with new arrivals
-            boundary = time.time() - float(Settings.POLL_OVERLAP_SECONDS)
-            last_poll_time[channel_id] = max(0.0, boundary)
+            if messages:
+                all_messages.extend(messages)
+                logger.debug(f"Fetched page {page_count}: {len(messages)} messages from {channel_id}")
 
-        return messages
+            # Check for pagination cursor
+            has_more = False
+            if hasattr(result, 'data') and isinstance(result.data, dict):
+                cursor = result.data.get('response_metadata', {}).get('next_cursor')
+                has_more = bool(cursor)
+            elif isinstance(result, dict):
+                cursor = result.get('response_metadata', {}).get('next_cursor')
+                has_more = bool(cursor)
+
+            if not has_more:
+                break
+
+        if all_messages:
+            logger.info(f"Fetched {len(all_messages)} total messages from {channel_id} ({page_count} pages)")
+
+        # Don't update checkpoint here - defer to caller after processing completes
+        return all_messages
+
+    except Exception as e:
+        logger.error(f"Error fetching messages from {channel_id}: {e}", exc_info=True)
+        return []
+
+
+def _update_channel_checkpoint(channel_id: str, messages: List[Dict]) -> None:
+    """
+    Update the poll checkpoint for a channel after messages are processed.
+
+    Should only be called after successful processing of all messages.
+    """
+    if not messages:
+        # No messages: keep a small overlap to avoid racing with new arrivals
+        boundary = time.time() - float(Settings.POLL_OVERLAP_SECONDS)
+        last_poll_time[channel_id] = max(0.0, boundary)
+        return
+
+    try:
+        max_ts = max(float(m.get('ts')) for m in messages if m.get('ts'))
+        last_poll_time[channel_id] = max_ts - float(Settings.POLL_OVERLAP_SECONDS)
+        readable_next = datetime.fromtimestamp(last_poll_time[channel_id]).strftime('%Y-%m-%d %H:%M:%S')
+        logger.debug(f"Next poll for {channel_id} will start at {readable_next}")
+    except Exception as e:
+        logger.debug(f"Error updating poll checkpoint: {e}, using current time")
+        last_poll_time[channel_id] = time.time() - float(Settings.POLL_OVERLAP_SECONDS)
 
     except Exception as e:
         logger.error(f"Error fetching messages from {channel_id}: {e}", exc_info=True)
@@ -268,8 +302,9 @@ def process_message(message: Dict, channel_id: str, user_mappings: Dict) -> bool
         user_id = message.get('user')
         message_text = message.get('text', '')
         message_ts = message.get('ts')
+        message_length = len(message_text)
 
-        logger.debug(f"Processing message from {user_id} in {channel_id}: {message_text[:60]}...")
+        logger.debug(f"Processing message from {user_id} in {channel_id} ({message_length} chars)")
 
         # Get Scalekit identifier for user
         identifier = get_slack_identifier(user_id, user_mappings)
@@ -375,7 +410,7 @@ def execute_github_action(
 ) -> Dict:
     """Execute GitHub issue creation."""
     try:
-        logger.debug(f"Creating GitHub issue from message: {message_text[:50]}...")
+        logger.debug(f"Creating GitHub issue from user {user_id} in {channel_id}")
 
         if not connector:
             logger.error("Connector not initialized")
@@ -442,10 +477,10 @@ def execute_github_action(
         send_slack_message(
             channel_id=channel_id,
             identifier=identifier,
-            text=f"❌ Error creating GitHub issue: {str(e)[:100]}",
+            text="❌ GitHub issue creation failed",
             thread_ts=thread_ts
         )
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": "issue creation failed"}
 
 
 def execute_zendesk_action(
@@ -458,14 +493,17 @@ def execute_zendesk_action(
 ) -> Dict:
     """Execute Zendesk ticket creation."""
     try:
-        logger.debug(f"Creating Zendesk ticket from message: {message_text[:50]}...")
+        logger.debug(f"Creating Zendesk ticket from user {user_id} in {channel_id}")
 
         if not connector:
             logger.error("Connector not initialized")
             return {"success": False, "error": "Connector not initialized"}
 
-        # Get requester email from user mapping
-        requester_email = user_mappings.get(user_id, {}).get('scalekit_identifier', identifier)
+        # Get requester email from user mapping - must be a real email
+        requester_email = user_mappings.get(user_id, {}).get('scalekit_identifier')
+        if not requester_email or '@' not in requester_email:
+            logger.error(f"Invalid requester email for user {user_id}: {requester_email}")
+            return {"success": False, "error": "User email not configured"}
 
         # Create ticket via Scalekit
         result = connector.execute_action_with_retry(
@@ -532,10 +570,10 @@ def execute_zendesk_action(
         send_slack_message(
             channel_id=channel_id,
             identifier=identifier,
-            text=f"❌ Error creating Zendesk ticket: {str(e)[:100]}",
+            text="❌ Zendesk ticket creation failed",
             thread_ts=thread_ts
         )
-        return {"success": False, "error": str(e)}
+        return {"success": False, "error": "ticket creation failed"}
 
 
 def send_slack_message(channel_id: str, identifier: str, text: str, thread_ts: Optional[str] = None) -> bool:
@@ -589,24 +627,23 @@ def poll_channels(user_mappings: Dict):
 
     This runs continuously in a loop, checking each channel
     at regular intervals.
+
+    Raises:
+        ValueError: If required configuration is missing
     """
     global _shutdown_requested
 
     if not Settings.ALLOWED_CHANNELS:
-        logger.error("No channels configured in ALLOWED_CHANNELS")
-        return
+        raise ValueError("No channels configured in ALLOWED_CHANNELS")
+
+    if not user_mappings:
+        raise ValueError("No users configured in user_mapping.json")
 
     # Get first user's identifier for fetching messages
-    # In production, you might want to use a service account
-    first_user = list(user_mappings.values())[0] if user_mappings else None
-    if not first_user:
-        logger.error("No users configured in user_mapping.json")
-        return
-
+    first_user = list(user_mappings.values())[0]
     identifier = first_user.get('scalekit_identifier')
     if not identifier:
-        logger.error("No scalekit_identifier found for first user")
-        return
+        raise ValueError("No scalekit_identifier found for first user")
 
     logger.info(f"Starting polling loop for {len(Settings.ALLOWED_CHANNELS)} channels")
     logger.info(f"Poll interval: {Settings.POLL_INTERVAL_SECONDS}s")
@@ -644,6 +681,7 @@ def poll_channels(user_mappings: Dict):
                         result = connector.execute_action_with_retry(
                             identifier=identifier,
                             tool='slack_fetch_conversation_history',
+                            connection_name=Settings.SCALEKIT_SLACK_CONNECTION,
                             parameters={
                                 'channel': channel_id,
                                 'limit': 10,
@@ -660,11 +698,6 @@ def poll_channels(user_mappings: Dict):
                         if alt_messages:
                             logger.debug(f"Fallback fetch returned {len(alt_messages)} messages for {channel_id}")
                             messages = alt_messages
-                            try:
-                                max_ts = max(float(m.get('ts')) for m in messages if m.get('ts'))
-                                last_poll_time[channel_id] = max_ts - float(Settings.POLL_OVERLAP_SECONDS)
-                            except Exception:
-                                last_poll_time[channel_id] = time.time() - float(Settings.POLL_OVERLAP_SECONDS)
                     except Exception as e:
                         logger.debug(f"Fallback fetch error for {channel_id}: {e}")
 
@@ -694,6 +727,9 @@ def poll_channels(user_mappings: Dict):
 
                     # Mark as processed
                     mark_message_processed(channel_id, message_ts)
+
+                # Update checkpoint only after all messages for this channel are processed
+                _update_channel_checkpoint(channel_id, messages)
 
             if processed_count > 0:
                 logger.info(f"Polling cycle #{poll_cycle}: processed {processed_count} message(s)")
@@ -854,33 +890,62 @@ def run_polling_mode():
     try:
         # Start Flask server in background thread for health checks and auth
         import threading
-        flask_thread = threading.Thread(
-            target=lambda: app.run(
-                host=Settings.FLASK_HOST,
-                port=Settings.FLASK_PORT,
-                debug=False,
-                use_reloader=False,
-                threaded=True
-            ),
-            daemon=True
-        )
+        import socket
+
+        flask_ready = threading.Event()
+
+        def run_flask():
+            try:
+                # Verify port is available before binding
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                result = sock.connect_ex((Settings.FLASK_HOST, Settings.FLASK_PORT))
+                sock.close()
+                if result == 0:
+                    raise RuntimeError(f"Port {Settings.FLASK_PORT} already in use")
+
+                flask_ready.set()
+                app.run(
+                    host=Settings.FLASK_HOST,
+                    port=Settings.FLASK_PORT,
+                    debug=False,
+                    use_reloader=False,
+                    threaded=True
+                )
+            except Exception as e:
+                logger.error(f"Flask startup failed: {e}", exc_info=True)
+                raise
+
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
         flask_thread.start()
-        logger.info(f"Flask server running on http://{Settings.FLASK_HOST}:{Settings.FLASK_PORT}")
+
+        # Wait for Flask to be ready with timeout
+        if flask_ready.wait(timeout=5.0):
+            logger.info(f"Flask server running on http://{Settings.FLASK_HOST}:{Settings.FLASK_PORT}")
+        else:
+            logger.error("Flask server startup timeout")
+            raise RuntimeError("Flask server failed to start within timeout")
 
     except Exception as e:
-        logger.error(f"Failed to start Flask server: {e}")
-        # Continue anyway - polling can work without Flask
+        logger.error(f"Failed to start Flask server: {e}", exc_info=True)
+        return False
 
     # Start polling
     try:
         poll_channels(user_mappings)
         return True
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
+        return False
     except Exception as e:
         logger.error(f"Fatal error in polling loop: {e}", exc_info=True)
         return False
 
 
 if __name__ == "__main__":
+    # Register signal handlers only in main thread
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
     exit_code = 0
     try:
         success = run_polling_mode()

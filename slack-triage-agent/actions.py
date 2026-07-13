@@ -204,6 +204,7 @@ class Actions:
                 data={
                     "ticket_id": ticket_id,
                     "ticket_url": ticket_url,
+                    "priority": priority,
                 }
             )
         else:

@@ -29,8 +29,9 @@ def _redact_secrets(text: str) -> str:
         (r'sk[_-][\w-]{20,}', '***REDACTED***'),              # Scalekit keys
         (r'xoxb-[\w-]+', '***REDACTED***'),                   # Slack bot token
         (r'xoxp-[\w-]+', '***REDACTED***'),                   # Slack user token
-        (r'Bearer\s+[\w-]+', 'Bearer ***REDACTED***'),        # Bearer tokens
-        (r'Authorization:\s+[\w-]+', 'Authorization: ***REDACTED***'),
+        (r'Bearer\s+[\w.-]+', 'Bearer ***REDACTED***'),       # Bearer tokens (JWT with dots)
+        (r'Authorization:\s+Bearer\s+[\w.-]+', 'Authorization: Bearer ***REDACTED***'),
+        (r'Authorization:\s+Basic\s+[\w=+/]+', 'Authorization: Basic ***REDACTED***'),
         (r'"token":\s*"[^"]*"', '"token": "***REDACTED***"'),
         (r'"access_token":\s*"[^"]*"', '"access_token": "***REDACTED***"'),
         (r'sk-[\w-]{30,}', '***REDACTED***'),                 # OpenAI API keys

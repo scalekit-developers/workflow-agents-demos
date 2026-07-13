@@ -26,9 +26,9 @@ This agent polls Slack for new messages, classifies them based on keywords, and 
 
 ```mermaid
 graph TD
-    A["Slack Workspace<br/>(C09K0K2RZ6Y)"] -->|monitor| B["Polling Agent<br/>(30s intervals)"]
+    A["Slack Workspace<br/>(C1234567890A)"] -->|monitor| B["Polling Agent<br/>(30s intervals)"]
     
-    B -->|fetch| C["Slack Bot<br/>(slack-sKfekCVz)"]
+    B -->|fetch| C["Slack Bot<br/>(slack-xxxxx)"]
     C -->|OAuth Token| D["Scalekit Vault<br/>(Secure Storage)"]
     
     B -->|route| E["Message Router"]
@@ -65,7 +65,7 @@ graph TD
 
 **File map:**
 
-```
+```text
 main_polling.py       Main polling loop + message processing
 sk_connectors.py      Scalekit API integration layer
 actions.py            GitHub, Zendesk, Slack action handlers
@@ -110,20 +110,20 @@ Edit `.env`:
 
 ```env
 # Scalekit credentials (from app.scalekit.com)
-SCALEKIT_ENV_URL=https://hey.scalekit.dev
-SCALEKIT_CLIENT_ID=skc_xxxxx
+SCALEKIT_ENV_URL=https://api.example.scalekit.com
+SCALEKIT_CLIENT_ID=skc_abcd1234xyz
 SCALEKIT_CLIENT_SECRET=test_xxxxx
 
 # Scalekit connector names
-SCALEKIT_SLACK_CONNECTION=slack-sKfekCVz
-SCALEKIT_GITHUB_CONNECTION=github-g0DJbhbx
+SCALEKIT_SLACK_CONNECTION=slack-xxxxx
+SCALEKIT_GITHUB_CONNECTION=github-xxxxx
 
 # Channel to monitor
-ALLOWED_CHANNELS=C09K0K2RZ6Y
+ALLOWED_CHANNELS=C1234567890A
 
 # GitHub target
-GITHUB_REPO_OWNER=parv15
-GITHUB_REPO_NAME=devops-assistant-agent
+GITHUB_REPO_OWNER=demo-user
+GITHUB_REPO_NAME=demo-repo
 
 # (Optional) Zendesk
 # SCALEKIT_ZENDESK_CONNECTION=zendesk
@@ -135,10 +135,10 @@ Edit `user_mapping.json`:
 
 ```json
 {
-  "U09LJ4LPSDU": {
-    "scalekit_identifier": "parv@infrasity.com",
-    "slack_username": "Parv Mittal",
-    "github_username": "parvmittal"
+  "U1234567890A": {
+    "scalekit_identifier": "user@example.com",
+    "slack_username": "Demo User",
+    "github_username": "demo-user"
   }
 }
 ```
@@ -155,7 +155,7 @@ python main_polling.py
 
 Post a message to your monitored Slack channel:
 
-```
+```text
 bug: Login button not working on mobile
 ```
 
@@ -170,20 +170,20 @@ Agent will:
 
 Messages are classified and routed based on keywords:
 
-| Keyword | Action | Destination |
-|---------|--------|-------------|
-| bug, issue, broken, error, crash | Create issue | GitHub |
-| feature, request, add, enhancement | Create issue | GitHub |
-| support, help, question, how | Create ticket | Zendesk |
-| Other text | Ignore | — |
+| Keyword | Action | Destination | Requires |
+|---------|--------|-------------|----------|
+| bug, issue, broken, error, crash | Create issue | GitHub | SCALEKIT_GITHUB_CONNECTION |
+| feature, request, add, enhancement | Create issue | GitHub | SCALEKIT_GITHUB_CONNECTION |
+| support, help, question, how | Create ticket | Zendesk | SCALEKIT_ZENDESK_CONNECTION |
+| Other text | Ignore | — | — |
 
 ---
 
 ## Message Processing Guarantees
 
-- **No duplicates**: Each message processed exactly once (timestamp tracking)
+- **No duplicates within a session**: Messages tracked in-memory by timestamp; restarting the agent will re-process older messages
 - **No feedback loops**: Bot replies filtered by `bot_id` field
-- **No thread recursion**: Thread replies ignored (thread_ts != ts check)
+- **No thread recursion**: Thread replies (messages with `thread_ts != ts`) are ignored
 
 ---
 
@@ -198,6 +198,7 @@ Messages are classified and routed based on keywords:
 | SCALEKIT_CLIENT_SECRET | Yes | — | Scalekit client secret |
 | SCALEKIT_SLACK_CONNECTION | Yes | — | Slack connector name in Scalekit |
 | SCALEKIT_GITHUB_CONNECTION | Yes | — | GitHub connector name in Scalekit |
+| SCALEKIT_ZENDESK_CONNECTION | No | — | Zendesk connector name (required for support routing) |
 | ALLOWED_CHANNELS | Yes | — | Slack channel IDs to monitor |
 | GITHUB_REPO_OWNER | Yes | — | GitHub username |
 | GITHUB_REPO_NAME | Yes | — | GitHub repository name |
@@ -278,11 +279,12 @@ Response time: ~1 second
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| scalekit | 2.12.0+ | OAuth & Actions API |
+| scalekit-sdk-python | 2.12.0+ | OAuth & Actions API |
 | langgraph | 0.1+ | Message routing graph |
 | flask | 3.0+ | Health endpoint |
-| langchain | Latest | LLM integration |
-| python-dotenv | Latest | .env loading |
+| langchain | 0.2+ | LLM integration |
+| python-dotenv | 1.1+ | .env loading |
+| colorama | 0.4.6+ | Colored terminal output |
 
 See `requirements.txt` for complete list.
 
