@@ -6,7 +6,12 @@ logger = logging.getLogger("offer-letter-agent")
 
 
 def ensure_authorized(connect: Any, connector_name: str, user_id: str) -> None:
-    """Check connector status. Prints a magic link if not yet authorized."""
+    """Check connector status. Prints a magic link if not yet authorized.
+
+    After the user confirms they've authorized, re-fetches the connected
+    account and verifies it actually reached ACTIVE — pressing Enter without
+    completing the OAuth flow must not be treated as success.
+    """
     try:
         resp = connect.get_or_create_connected_account(
             connection_name=connector_name, identifier=user_id
@@ -19,6 +24,16 @@ def ensure_authorized(connect: Any, connector_name: str, user_id: str) -> None:
                 f"Not authorized. {connector_name} ({user_id})\nOpen: {link}"
             )
             input("Press Enter after authorizing...")
+
+            resp = connect.get_or_create_connected_account(
+                connection_name=connector_name, identifier=user_id
+            )
+            if resp.connected_account.status != "ACTIVE":
+                raise RuntimeError(
+                    f"{connector_name} ({user_id}) is still not ACTIVE "
+                    f"(status={resp.connected_account.status}) — authorization did not complete"
+                )
+            logger.info(f"{connector_name} ({user_id}) — ACTIVE")
         else:
             logger.info(f"{connector_name} ({user_id}) — ACTIVE")
     except Exception as e:

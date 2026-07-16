@@ -15,6 +15,8 @@ Verified live against SLACKMCP's actual MCP server (2026-07-15):
   - slack_get_reactions returns a human-readable sentence, not a list, e.g.
     "Reactions on message:\\n\\n:white_check_mark: × 1 — Name (UID)" or
     "No reactions found on this message." when empty — parsed with regex.
+    The reactor's Slack user id is captured too, since the approval gate
+    needs to check *who* reacted, not just which emoji was used.
 """
 import json
 import logging
@@ -23,7 +25,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger("offer-letter-agent")
 
-_REACTION_LINE_RE = re.compile(r":(?P<emoji>[\w+-]+):\s*×\s*\d+")
+_REACTION_LINE_RE = re.compile(r":(?P<emoji>[\w+-]+):\s*×\s*\d+.*?\((?P<user_id>U\w+)\)")
 
 
 class SlackMCPConnector:
@@ -66,8 +68,13 @@ class SlackMCPConnector:
             logger.info(f"Posted to Slack via slackmcp (channel={channel_id}, ts={ctx['message_ts']})")
         return ctx or None
 
-    def get_reaction_emojis(self, channel_id: str, message_ts: str) -> list[str]:
-        """Return the list of distinct emoji names reacted on a message (empty if none)."""
+    def get_reactions(self, channel_id: str, message_ts: str) -> list[tuple[str, str]]:
+        """Return (emoji, reactor_user_id) pairs for a message (empty if none).
+
+        Reactor identity is required so the approval gate can check that the
+        reaction actually came from the configured hiring manager, not just
+        anyone in the channel (including, in principle, the candidate).
+        """
         parsed = self._call(
             "slackmcp_slack_get_reactions",
             {"channel_id": channel_id, "message_ts": message_ts},
@@ -78,3 +85,11 @@ class SlackMCPConnector:
         if "No reactions found" in text:
             return []
         return _REACTION_LINE_RE.findall(text)
+
+    def get_reaction_emojis(self, channel_id: str, message_ts: str) -> list[str]:
+        """Return just the emoji names reacted on a message, ignoring reactor identity.
+
+        Prefer get_reactions() for anything approval-related — this exists
+        only for callers that genuinely don't care who reacted.
+        """
+        return [emoji for emoji, _user_id in self.get_reactions(channel_id, message_ts)]

@@ -4,7 +4,7 @@ from datetime import date, datetime
 from dataclasses import dataclass
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-_SALARY_RE = re.compile(r"^\$?[\d,]+(\.\d{2})?$")
+_SALARY_RE = re.compile(r"^\$?\d{1,3}(,\d{3})*(\.\d{2})?$|^\$?\d+(\.\d{2})?$")
 
 
 @dataclass

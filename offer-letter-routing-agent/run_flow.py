@@ -118,10 +118,7 @@ def main() -> int:
             logger.error(f"Invalid offer request: {e}")
             return 1
 
-        logger.info(
-            f"Candidate: {offer.candidate_first_name} {offer.candidate_last_name} | "
-            f"Role: {offer.role_title} | Salary: {offer.base_salary} | Start: {offer.start_date}"
-        )
+        logger.info("Offer request validated")
 
         # Step 1: Auth check — every call below is scoped to the recruiter's own identity
         # (per-connector, since a recruiter may have authorized each service under
@@ -175,7 +172,12 @@ def main() -> int:
                 f"Document {document_id} still 'Uploaded' after 10s — continuing anyway"
             )
 
-        destination = args.hiring_manager or settings.SLACK_HIRING_MANAGER_ID or settings.SLACK_APPROVALS_CHANNEL
+        # Normalize to None (not "") when unset — approval_gate.py checks
+        # `is not None` to decide whether to restrict reactions to a specific
+        # approver, and an empty string would incorrectly activate that filter,
+        # silently rejecting every real reaction from anyone.
+        hiring_manager_id = args.hiring_manager or settings.SLACK_HIRING_MANAGER_ID or None
+        destination = hiring_manager_id or settings.SLACK_APPROVALS_CHANNEL
         slack = SlackConnector(connect, settings.SLACK_USER, settings.SLACK_CONNECTOR)
 
         if settings.REQUIRE_APPROVAL:
@@ -207,12 +209,18 @@ def main() -> int:
                 f"Waiting up to {settings.APPROVAL_TIMEOUT_SECONDS}s for a "
                 f":{settings.APPROVE_EMOJI}: or :{settings.REJECT_EMOJI}: reaction"
             )
+            # Restrict who can resolve the gate to the configured hiring manager
+            # when we know their user id — a shared approvals channel can have
+            # other members, and only that specific reaction should count.
+            # Left unrestricted only when no manager id is configured at all
+            # (e.g. routed to a channel with no designated approver).
             result = wait_for_approval(
-                get_reactions=lambda: slack_mcp.get_reaction_emojis(destination, posted["message_ts"]),
+                get_reactions=lambda: slack_mcp.get_reactions(destination, posted["message_ts"]),
                 approve_emoji=settings.APPROVE_EMOJI,
                 reject_emoji=settings.REJECT_EMOJI,
                 poll_interval_seconds=settings.APPROVAL_POLL_INTERVAL_SECONDS,
                 timeout_seconds=settings.APPROVAL_TIMEOUT_SECONDS,
+                approver_user_id=hiring_manager_id,
             )
 
             if result.timed_out:
@@ -255,8 +263,11 @@ def main() -> int:
             ),
         )
         if not sent:
-            logger.error("Failed to send document — it remains in draft in PandaDoc")
-            # Not fatal: the doc exists and can be sent manually.
+            logger.error(
+                f"Failed to send document {document_id} — it remains in Draft in PandaDoc. "
+                f"Not emailing the candidate, since the offer was never actually sent."
+            )
+            return 1
 
         # Step 5: Email the candidate the actual offer document link
         logger.info("Step 5: Emailing the offer document to the candidate")

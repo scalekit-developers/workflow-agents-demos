@@ -35,8 +35,12 @@ class Settings:
         self.REQUIRE_APPROVAL = os.environ.get("REQUIRE_APPROVAL", "true").lower() not in ("false", "0", "no")
         self.APPROVE_EMOJI = os.environ.get("APPROVE_EMOJI", "white_check_mark")
         self.REJECT_EMOJI = os.environ.get("REJECT_EMOJI", "x")
-        self.APPROVAL_POLL_INTERVAL_SECONDS = int(os.environ.get("APPROVAL_POLL_INTERVAL_SECONDS", "30"))
-        self.APPROVAL_TIMEOUT_SECONDS = int(os.environ.get("APPROVAL_TIMEOUT_SECONDS", str(30 * 60)))
+        self.APPROVAL_POLL_INTERVAL_SECONDS = self._parse_positive_int(
+            "APPROVAL_POLL_INTERVAL_SECONDS", "30"
+        )
+        self.APPROVAL_TIMEOUT_SECONDS = self._parse_positive_int(
+            "APPROVAL_TIMEOUT_SECONDS", str(30 * 60)
+        )
 
         # PandaDoc: a real template is required — PandaDoc's live MCP server does
         # not currently implement Markdown-based document creation (see README
@@ -48,12 +52,28 @@ class Settings:
 
         # Slack: where approval requests are routed. Can be overridden per-request
         # with a specific hiring manager Slack user ID.
-        self.SLACK_HIRING_MANAGER_ID = os.environ.get("SLACK_HIRING_MANAGER_ID")
-        self.SLACK_APPROVALS_CHANNEL = os.environ.get("SLACK_APPROVALS_CHANNEL")
+        # Normalized to None (not "") when unset in .env — downstream code
+        # checks `is not None` to decide whether to restrict the approval
+        # gate to a specific approver, and an empty string would wrongly
+        # activate that filter and reject every real reaction.
+        self.SLACK_HIRING_MANAGER_ID = os.environ.get("SLACK_HIRING_MANAGER_ID") or None
+        self.SLACK_APPROVALS_CHANNEL = os.environ.get("SLACK_APPROVALS_CHANNEL") or None
 
         self.COMPANY_NAME = os.environ.get("COMPANY_NAME", "Our Company")
 
         self.LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+
+    @staticmethod
+    def _parse_positive_int(env_var: str, default: str) -> int:
+        """Parse an env var as a strictly positive int, raising ValueError on bad input."""
+        raw = os.environ.get(env_var, default)
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f"{env_var} must be a whole number of seconds, got: {raw!r}")
+        if value <= 0:
+            raise ValueError(f"{env_var} must be a positive number of seconds, got: {value}")
+        return value
 
     def validate(self) -> None:
         """Fail fast if required vars are missing."""
