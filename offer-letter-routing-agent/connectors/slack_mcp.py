@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger("offer-letter-agent")
 
-_REACTION_LINE_RE = re.compile(r":(?P<emoji>[\w+-]+):\s*×\s*\d+.*?\((?P<user_id>U\w+)\)")
+_REACTION_LINE_RE = re.compile(r":(?P<emoji>[\w+-]+):\s*×\s*\d+.*?\((?P<user_id>[UW]\w+)\)")
 
 
 class SlackMCPConnector:
