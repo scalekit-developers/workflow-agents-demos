@@ -194,7 +194,7 @@ class NotionConnector(Connector):
             return None
 
         for result in data.get("results", []) or []:
-            if result.get("title") == title:
+            if _extract_page_title(result) == title:
                 return result.get("id")
         return None
 
