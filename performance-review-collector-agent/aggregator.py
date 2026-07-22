@@ -27,7 +27,11 @@ class EmployeeFeedback:
 
     def add_airtable_record(self, fields: Dict) -> None:
         for field_name, value in fields.items():
-            if _RATING_FIELD_PATTERN.search(field_name) and isinstance(value, (int, float)):
+            if (
+                _RATING_FIELD_PATTERN.search(field_name)
+                and isinstance(value, (int, float))
+                and not isinstance(value, bool)
+            ):
                 self.ratings.setdefault(field_name, []).append(float(value))
             elif isinstance(value, str) and field_name.lower() in (
                 "comments", "comment", "feedback", "notes"
@@ -79,17 +83,19 @@ def resolve_direct_reports(
     Falls back to the configured DIRECT_REPORTS list if no record names the manager
     (e.g. the field is empty or the manager hasn't been assigned reviews yet).
     """
-    from_airtable = set()
+    from_airtable = {}
     for record in airtable_records:
         fields = record.get("fields", {})
         record_manager = str(fields.get(manager_field, "")).strip().lower()
         if record_manager == manager_email.strip().lower():
             employee = fields.get(employee_field)
             if employee:
-                from_airtable.add(employee)
+                normalized = str(employee).strip().casefold()
+                # Keep the first-seen canonical spelling/casing for display.
+                from_airtable.setdefault(normalized, str(employee).strip())
 
     if from_airtable:
-        return sorted(from_airtable)
+        return sorted(from_airtable.values())
 
     if configured_reports:
         logger.warning(
@@ -109,27 +115,38 @@ def build_employee_feedback(
     form_responses: List[Dict],
     form_employee_question_id: str,
 ) -> Dict[str, EmployeeFeedback]:
-    """Group Airtable records and Google Forms responses by employee name."""
+    """Group Airtable records and Google Forms responses by employee name.
+
+    Matching is case- and whitespace-insensitive (e.g. "alex kim " matches
+    "Alex Kim"), but bundles are keyed by the canonical name from
+    direct_reports so Notion pages and Slack digests show consistent spelling.
+    """
     bundles = {name: EmployeeFeedback(name) for name in direct_reports}
-    reports_set = set(direct_reports)
+    normalized_to_canonical = {name.strip().casefold(): name for name in direct_reports}
 
     for record in airtable_records:
         fields = record.get("fields", {})
         employee = fields.get(employee_field)
-        if employee in reports_set:
-            bundles[employee].add_airtable_record(fields)
+        canonical = normalized_to_canonical.get(str(employee).strip().casefold()) if employee else None
+        if canonical:
+            bundles[canonical].add_airtable_record(fields)
 
     for response in form_responses:
         answers = response.get("answers", {})
         employee = _extract_form_employee(answers, form_employee_question_id)
-        if employee not in reports_set:
+        canonical = normalized_to_canonical.get(str(employee).strip().casefold()) if employee else None
+        if not canonical:
+            logger.warning(
+                f"Form response references unrecognized employee {employee!r} -- "
+                f"skipping (does not match any direct report)"
+            )
             continue
         for question_id, answer in answers.items():
             if question_id == form_employee_question_id:
                 continue
             text = _extract_answer_text(answer)
             if text:
-                bundles[employee].add_form_comment(text)
+                bundles[canonical].add_form_comment(text)
 
     return bundles
 

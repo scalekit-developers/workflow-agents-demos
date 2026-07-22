@@ -26,6 +26,7 @@ def _redact_secrets(text: str) -> str:
         return text
     patterns = [
         (r'sk[_-][\w-]{20,}', '***REDACTED***'),
+        (r'skc_[\w-]+', '***REDACTED***'),
         (r'test_[\w-]{20,}', '***REDACTED***'),
         (r'Bearer\s+[\w-]+', 'Bearer ***REDACTED***'),
         (r'Authorization:\s+[\w-]+', 'Authorization: ***REDACTED***'),

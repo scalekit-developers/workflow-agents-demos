@@ -26,6 +26,7 @@ Exit codes:
 import signal
 import sys
 import time
+from typing import Optional
 
 import scalekit.client
 from dotenv import load_dotenv
@@ -78,7 +79,7 @@ def init_scalekit(cfg: Config):
         logger.debug("Scalekit client initialized")
         return sk
     except Exception as e:
-        logger.error(f"Failed to initialize Scalekit: {e}")
+        logger.error(f"Failed to initialize Scalekit: {e}", exc_info=True)
         sys.exit(1)
 
 
@@ -129,11 +130,22 @@ def build_slack_digest(manager_email: str, review_period: str, results: list) ->
     return "\n".join(lines)
 
 
-def run_cycle(cfg: Config, actions, state: StateManager) -> int:
+def run_cycle(cfg: Config, actions, state: StateManager) -> Optional[int]:
     """
     Run one full collection cycle for the configured manager.
-    Returns the number of employees successfully summarized.
+
+    Returns the number of employees successfully summarized, or None if there
+    was nothing to do at all (no direct reports resolved, or this manager's
+    review period was already processed) -- distinct from 0, which means
+    direct reports were found but none had any feedback yet.
     """
+    if state.is_processed(cfg.manager_email, cfg.review_period):
+        logger.info(
+            f"Manager '{cfg.manager_email}' / period '{cfg.review_period}' already "
+            f"processed -- skipping (delete state/processed_cycles.json to reprocess)"
+        )
+        return None
+
     airtable = AirtableConnector(actions, cfg.airtable_user, cfg.airtable_connector)
     forms = GoogleFormsConnector(actions, cfg.google_forms_user, cfg.google_forms_connector)
     notion = NotionConnector(actions, cfg.notion_user, cfg.notion_connector)
@@ -171,7 +183,7 @@ def run_cycle(cfg: Config, actions, state: StateManager) -> int:
 
     if not direct_reports:
         logger.warning(f"No direct reports resolved for {cfg.manager_email} -- nothing to summarize")
-        return 0
+        return None
 
     logger.info(f"Scoped to {len(direct_reports)} direct report(s): {', '.join(direct_reports)}")
 
@@ -275,7 +287,7 @@ def main() -> int:
         while True:
             if _shutdown_requested:
                 logger.info("Graceful shutdown")
-                return 0
+                return 130
 
             cycle += 1
             logger.info(f"Polling cycle #{cycle}")
@@ -297,11 +309,13 @@ def main() -> int:
             for _ in range(cfg.poll_interval_minutes * 60):
                 if _shutdown_requested:
                     logger.info("Graceful shutdown")
-                    return 0
+                    return 130
                 time.sleep(1)
 
     else:
         count = run_cycle(cfg, actions, state)
+        if count is None:
+            return 0
         if count:
             logger.info(f"✓ Summarized {count} employee(s)")
             return 0

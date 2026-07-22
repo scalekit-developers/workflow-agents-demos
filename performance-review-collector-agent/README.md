@@ -75,7 +75,8 @@ graph TB
 - A Google Form collecting free-text feedback, with a question identifying which employee the feedback is about (the agent validates this at startup but cannot create form questions via API — see [Provisioning](#provisioning--auto-setup) below)
 - A Notion workspace with a parent page to hold per-employee summary pages
 - A Slack workspace where the agent can DM the manager
-- An [OpenRouter](https://openrouter.ai) API key (optional; falls back to a deterministic rule-based summary)
+- An [OpenRouter](https://openrouter.ai) API key (optional; falls back to a deterministic rule-based summary). 
+**Data flow note:** setting `OPENROUTER_API_KEY` sends each employee's name and their raw feedback comments to OpenRouter's third-party API to generate the narrative summary. Leave it unset to keep all summarization local (rule-based, no data leaves your Scalekit-connected services) — assess this against your organization's data-handling policies before enabling it for real employee reviews.
 
 ## Setup
 

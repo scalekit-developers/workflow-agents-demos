@@ -34,7 +34,7 @@ class Config:
         self.airtable_connector = os.environ.get("AIRTABLE_CONNECTOR", "airtable")
         self.google_forms_connector = os.environ.get("GOOGLE_FORMS_CONNECTOR", "googleforms")
         self.notion_connector = os.environ.get("NOTION_CONNECTOR", "NOTIONMCP")
-        self.slack_connector = os.environ.get("SLACK_CONNECTOR", "SLACKMCP")
+        self.slack_connector = os.environ.get("SLACK_CONNECTOR", "slackmcp")
 
         # Manager running this cycle -- used to scope direct reports
         self.manager_email = os.environ.get("MANAGER_EMAIL")
