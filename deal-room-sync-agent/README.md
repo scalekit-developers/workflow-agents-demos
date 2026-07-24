@@ -36,7 +36,7 @@ graph TB
     subgraph Core["Agent Core"]
         CONFIG["config.py<br/>Validation"]
         LOGGING["logging_config.py<br/>Structured Logging"]
-        STATE["state.py<br/>Cycle Tracking"]
+        STATE["state.py<br/>Deal Fingerprint<br/>Change Detection"]
         PROV["provisioning.py<br/>Opportunity + Doc Checks"]
     end
 
@@ -44,21 +44,27 @@ graph TB
         F["1. Fetch Opportunity<br/>Context (Salesforce)"]
         SLK["2. Capture Slack<br/>Discussion Excerpts"]
         AGG["Aggregate into<br/>Deal Summary"]
+        FP["Fingerprint changed<br/>since last sync?"]
         D["3. Sync Comment<br/>to Deal Room Doc"]
+        SKIP["Skip Drive Sync<br/>(unchanged)"]
     end
 
     SF -.->|Via Scalekit| F
     F --> SLK
     SL -.->|Via Scalekit| SLK
     SLK --> AGG
-    AGG --> D
+    AGG --> FP
+    STATE -.->|reads/writes last fingerprint| FP
+    FP -->|yes| D
+    FP -->|no| SKIP
     GD -.->|Via Scalekit| D
 
     Scalekit --> Pipeline
     Core --> Pipeline
     PROV --> F
     PROV --> D
-    Pipeline --> Output["Exit Code"]
+    D --> Output["Exit Code"]
+    SKIP --> Output
 ```
 
 ## Prerequisites
@@ -120,15 +126,15 @@ Process one sync cycle and exit:
 python run_flow.py
 ```
 
-Ideal for cron jobs, CI/CD pipelines, manual runs, or serverless functions. One sync per opportunity per calendar day is the default cadence (tracked in `state/synced_cycles.json`), so a daily cron entry is the primary deployment pattern:
+Ideal for cron jobs, CI/CD pipelines, manual runs, or serverless functions. The agent only writes a new Drive comment when the deal's content has actually changed since the last sync (see [State](#state) below), so running it on a schedule is safe even if nothing has moved:
 
 ```bash
-0 8 * * * cd /path/to/agent && python run_flow.py   # daily, 8am
+0 8 * * * cd /path/to/agent && python run_flow.py   # check daily, 8am
 ```
 
 ### Continuous Mode (Polling)
 
-Run indefinitely, re-checking on an interval:
+Because the Drive sync is gated by real content change, polling mode is a genuine change detector, not a once-per-day digest: leave it running continuously and it stays quiet until the opportunity or Slack discussion actually changes, then syncs.
 
 ```bash
 POLLING_MODE=true POLL_INTERVAL_MINUTES=60 python run_flow.py
@@ -168,7 +174,7 @@ Environment variables (set in `.env`):
 
 | Code | Meaning | Use Case |
 |------|---------|----------|
-| `0` | Success | Summary synced, or already synced this cycle (nothing new to do) |
+| `0` | Success | Deal context checked; Drive comment synced only if it changed since the last sync |
 | `1` | Error | Config missing, auth failed, provisioning failed, or 5 consecutive polling errors; investigate logs |
 | `2` | No data | Opportunity found but had no useful context to sync: no Salesforce next step and no Slack discussion found |
 | `130` | Interrupted | Graceful shutdown via Ctrl+C or SIGTERM |
@@ -200,7 +206,12 @@ POLLING_MODE=true POLL_INTERVAL_MINUTES=30 python run_flow.py
 
 ### State
 
-Processed `(opportunity_id, sync_cycle)` pairs are stored in `state/synced_cycles.json`, one entry per opportunity per calendar day by default, so re-running the agent within the same day won't re-post a duplicate Drive comment.
+Every cycle fetches fresh context from Salesforce and Slack. Whether a new Drive comment gets written is decided separately: `state.py` computes a content fingerprint over the opportunity's stage, amount, close date, next step, and the exact set of Slack excerpts captured, and only syncs when that fingerprint differs from the last one synced for this opportunity. This means:
+
+- Running the agent repeatedly with an unchanged deal checks Salesforce and Slack each time but never re-posts the same comment to the deal room doc.
+- A stage change, amount update, new next step, or a new relevant Slack message changes the fingerprint and triggers a fresh sync on the next cycle, whether that's minutes or days later.
+
+The last-synced fingerprint per opportunity is stored in `state/synced_cycles.json`.
 
 ```bash
 rm -f state/synced_cycles.json   # reset, e.g. to force a re-sync for testing
@@ -232,61 +243,3 @@ rm -f state/synced_cycles.json   # reset, e.g. to force a re-sync for testing
 | Deal room doc body never updates | Expected: `GOOGLEDRIVE` cannot write Google Doc body content. The summary is posted as a Drive comment instead. See Error Handling & Edge Cases above |
 | Google Drive step fails but Salesforce/Slack steps succeeded | Authorize `GOOGLEDRIVE` for the identity in `GOOGLE_DRIVE_USER` via the link printed in the Step 0 logs, or in the Scalekit dashboard |
 | `No colored output` | Colors auto-disable when output is piped; force with `FORCE_COLOR=1` |
-
-## Deployment
-
-### Cron (recommended for daily cadence)
-
-```bash
-crontab -e
-# Daily deal room sync, 8am
-0 8 * * * cd /path/to/deal-room-sync-agent && /path/to/.venv/bin/python run_flow.py >> /var/log/deal-room-sync-agent.log 2>&1
-```
-
-### systemd (for polling mode)
-
-```ini
-[Unit]
-Description=Deal Room Sync Agent
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/path/to/deal-room-sync-agent
-EnvironmentFile=/path/to/deal-room-sync-agent/.env
-ExecStart=/path/to/.venv/bin/python run_flow.py
-Environment=POLLING_MODE=true
-Environment=POLL_INTERVAL_MINUTES=60
-Restart=on-failure
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### Docker
-
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-CMD ["python", "run_flow.py"]
-```
-
-```bash
-docker build -t deal-room-sync-agent .
-docker run --env-file .env deal-room-sync-agent
-```
-
-## Production Checklist
-
-- [ ] All three Scalekit connections (Salesforce, SlackMCP, Google Drive) show `ACTIVE` for the identities configured in `.env`
-- [ ] `SALESFORCE_CONNECTOR` / `SLACK_CONNECTOR` / `GOOGLE_DRIVE_CONNECTOR` are set to the exact per-workspace connection names, not generic provider labels
-- [ ] `OPPORTUNITY_ID` is set (not just `OPPORTUNITY_NAME`) for unambiguous targeting once you know the exact Id
-- [ ] `DEAL_ROOM_DOC_ID` points at a real, accessible Google Drive file created and shared in advance
-- [ ] Everyone who needs the deal summary knows to look in the Drive file's **comment sidebar**, not the doc body, given the `GOOGLEDRIVE` body-content limitation documented above
-- [ ] `state/synced_cycles.json` is on persistent storage if deploying to an ephemeral container, so restarts don't re-post a duplicate comment the same day
-- [ ] Cron/systemd schedule matches how often your team actually wants deal room updates (daily is the documented default)
-- [ ] Confirmed via logs (or a manual dry run) that Salesforce and Slack degrade gracefully and Google Drive fails loudly and clearly if any one connector loses authorization, rather than silently posting an incomplete summary

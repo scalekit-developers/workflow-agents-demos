@@ -17,7 +17,8 @@ Setup:
   python run_flow.py           # run one sync cycle and exit
 
 Exit codes:
-  0   = success (summary synced, or nothing new to do this cycle)
+  0   = success (deal context checked; Drive synced only if it changed
+        since the last sync for this opportunity)
   1   = error (config missing, auth failed, provisioning failed, or 5
         consecutive polling errors)
   2   = no data (opportunity found but had no useful context to sync -- no
@@ -45,7 +46,7 @@ from connectors import (
 )
 import logging_config
 from provisioning import ProvisioningError, ensure_deal_room_doc, ensure_opportunity_findable
-from state import StateManager
+from state import StateManager, compute_deal_fingerprint
 
 load_dotenv()
 logger = logging_config.setup_logging(__name__)
@@ -88,12 +89,19 @@ def run_cycle(cfg: Config, actions, state: StateManager) -> Optional[int]:
     """
     Run one full sync cycle for the configured opportunity.
 
-    Returns 1 if the summary was synced, 0 if the opportunity had nothing
-    useful to sync this cycle, or None if this (opportunity, cycle) pair was
-    already synced -- distinct from 0, which means real work was attempted
-    but found no meaningful context.
+    Always fetches fresh Salesforce and Slack context. Only writes a new
+    Drive comment when the deal's content (stage, amount, close date, next
+    step, or the set of relevant Slack excerpts) has actually changed since
+    the last sync for this opportunity -- not just once per calendar day.
+    This makes polling mode a real change detector: unchanged data across
+    polls stays silent, and any real movement in Salesforce or Slack
+    triggers a fresh sync.
+
+    Returns the number of Slack excerpts captured this cycle (>= 0), or None
+    if there was no meaningful context at all to sync (no Salesforce next
+    step and no Slack discussion found).
     """
-    sync_cycle = time.strftime("%Y-%m-%d")  # one sync per opportunity per day by default
+    sync_label = time.strftime("%Y-%m-%d")  # display label only, not a dedup key
 
     salesforce = SalesforceConnector(actions, cfg.salesforce_user, cfg.salesforce_connector)
     slack = SlackConnector(actions, cfg.slack_user, cfg.slack_connector)
@@ -107,13 +115,6 @@ def run_cycle(cfg: Config, actions, state: StateManager) -> Optional[int]:
         raise
 
     deal = DealContext(opportunity)
-
-    if state.is_processed(deal.opportunity_id, sync_cycle):
-        logger.info(
-            f"Opportunity '{deal.name}' already synced for cycle '{sync_cycle}' -- "
-            f"skipping (delete state/synced_cycles.json to force a re-sync)"
-        )
-        return None
 
     logger.info(
         f"  {deal.name} | Stage: {deal.stage} | Amount: {deal.amount} | "
@@ -135,10 +136,18 @@ def run_cycle(cfg: Config, actions, state: StateManager) -> Optional[int]:
 
     if not deal.next_step and not deal.has_slack_context():
         logger.info("No Salesforce next step and no Slack discussion found -- nothing meaningful to sync")
-        return 0
+        return None
 
-    logger.info("Step 3: Syncing summary to the Google Drive deal room doc")
-    summary = build_deal_summary(deal, ae_email=cfg.ae_email, sync_label=sync_cycle)
+    fingerprint = compute_deal_fingerprint(deal, deal.slack_excerpts)
+    if not state.has_changed(deal.opportunity_id, fingerprint):
+        logger.info(
+            f"Deal context unchanged since the last sync for '{deal.name}' -- "
+            f"skipping Drive sync (delete state/synced_cycles.json to force a re-sync)"
+        )
+        return len(deal.slack_excerpts)
+
+    logger.info("Step 3: Syncing summary to the Google Drive deal room doc (context changed since last sync)")
+    summary = build_deal_summary(deal, ae_email=cfg.ae_email, sync_label=sync_label)
 
     try:
         doc = ensure_deal_room_doc(
@@ -154,13 +163,13 @@ def run_cycle(cfg: Config, actions, state: StateManager) -> Optional[int]:
 
     try:
         drive.sync_deal_summary(doc.get("id"), summary)
-        logger.info(f"✓ Summary synced to deal room doc '{doc.get('name')}'")
+        logger.info(f"[OK] Summary synced to deal room doc '{doc.get('name')}'")
+        state.mark_synced(deal.opportunity_id, fingerprint)
     except ConnectorError as e:
         logger.error(f"Failed to sync summary to Drive: {e}")
         raise
 
-    state.mark_processed(deal.opportunity_id, sync_cycle)
-    return 1
+    return len(deal.slack_excerpts)
 
 
 def main() -> int:
@@ -200,12 +209,10 @@ def main() -> int:
             try:
                 result = run_cycle(cfg, actions, state)
                 consecutive_errors = 0
-                if result == 1:
-                    logger.info("✓ Deal room synced")
-                elif result == 0:
+                if result is None:
                     logger.info("Nothing meaningful to sync this cycle")
                 else:
-                    logger.info("Already synced for this cycle")
+                    logger.info(f"[OK] Checked deal context ({result} Slack excerpt(s))")
             except (ProvisioningError, ConnectorError) as e:
                 consecutive_errors += 1
                 logger.error(f"Error during cycle: {e}")
@@ -232,12 +239,10 @@ def main() -> int:
             return 1
 
         if result is None:
-            return 0
-        if result == 1:
-            logger.info("✓ Deal room synced")
-            return 0
-        logger.info("Opportunity had nothing meaningful to sync this cycle")
-        return 2
+            logger.info("Opportunity had nothing meaningful to sync this cycle")
+            return 2
+        logger.info(f"[OK] Checked deal context ({result} Slack excerpt(s))")
+        return 0
 
 
 def _connector_for_check(actions, connector_name: str, identifier: str):
