@@ -42,8 +42,11 @@ class Config:
         # not scoped to a single owner/rep.
         self.analyst_email = os.environ.get("ANALYST_EMAIL")
 
-        # Forecast period label (e.g. "2026-W30" or "Q3 2026") -- used for the
-        # state-guard key and as a column in the Google Sheets log.
+        # Forecast period label (e.g. "2026-W30" or "Q3 2026") -- a human-
+        # readable label shown in commentary and logged as a Google Sheets
+        # column. Does NOT gate whether Slack gets a post: that's decided by
+        # whether the pipeline content actually changed since the last post
+        # (see state.py's fingerprint-based change detection).
         self.forecast_period = os.environ.get("FORECAST_PERIOD", "")
 
         # Slack destination -- a channel name (e.g. "#revenue-ops") that gets

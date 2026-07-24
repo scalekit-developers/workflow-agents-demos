@@ -39,23 +39,29 @@ graph TB
     subgraph Core["Agent Core"]
         CONFIG["config.py<br/>Validation"]
         LOGGING["logging_config.py<br/>Structured Logging"]
-        STATE["state.py<br/>Cycle Tracking"]
+        STATE["state.py<br/>Pipeline Fingerprint<br/>Change Detection"]
     end
 
     subgraph Pipeline["Forecast Pipeline"]
         F["1. Fetch<br/>Salesforce + HubSpot"]
         AGG["2. Calculate Coverage<br/>+ Flag At-Risk"]
+        FP["Fingerprint changed<br/>since last post?"]
         W["3. Draft + Post to Slack"]
-        D["4. Log to Google Sheets"]
+        SKIP["Skip Slack<br/>(unchanged)"]
+        D["4. Log to Google Sheets<br/>(always runs)"]
     end
 
     SF -.->|Via Scalekit| F
     HS -.->|Via Scalekit| F
     F --> AGG
     LLM -.->|Direct call, optional| AGG
-    AGG --> W
+    AGG --> FP
+    STATE -.->|reads/writes last fingerprint| FP
+    FP -->|yes| W
+    FP -->|no| SKIP
     SL -.->|Via Scalekit| W
     W --> D
+    SKIP --> D
     GS -.->|Via Scalekit| D
 
     Scalekit --> Pipeline
@@ -107,7 +113,7 @@ In the [Scalekit dashboard](https://scalekit.com), add four connections under Ag
 ### 4. Point the agent at your real data
 
 - `ANALYST_EMAIL`: the RevOps analyst this cycle is labeled under (commentary and Sheets log; pipeline queries themselves are org-wide, not scoped to a single rep)
-- `FORECAST_PERIOD`: a label like `2026-W30` or `Q3 2026`. Leave blank to default to the current ISO week
+- `FORECAST_PERIOD`: a display label like `2026-W30` or `Q3 2026` shown in commentary and the Sheets log. Leave blank to default to the current ISO week. This is a label only: it does not control whether Slack gets a post, see [State](#state) below
 - `SLACK_CHANNEL`: a channel name like `#revenue-ops` (resolved to an ID automatically) or a literal channel/user ID
 - `GOOGLE_SHEETS_SPREADSHEET_ID` / `GOOGLE_SHEETS_TAB_NAME`: your destination spreadsheet and tab
 - `COVERAGE_RATIO_TARGET` / `QUOTA_TARGET`: your team's coverage target multiple and quota figure (see [Coverage Ratio Formula](#coverage-ratio-formula--at-risk-flagging) below)
@@ -182,7 +188,7 @@ Environment variables (set in `.env`):
 | `SLACK_CONNECTOR` | `slackmcp` | Exact connection name; must be an MCP-variant Slack connection |
 | `GOOGLE_SHEETS_CONNECTOR` | `googlesheets-BOzvgKS0` | Exact connection name (often auto-suffixed) |
 | `ANALYST_EMAIL` | - | Required: analyst this cycle is labeled under |
-| `FORECAST_PERIOD` | current ISO week | Label used in commentary and the Sheets log, e.g. `Q3 2026` |
+| `FORECAST_PERIOD` | current ISO week | Display label only, used in commentary and the Sheets log, e.g. `Q3 2026`. Does not gate the Slack post |
 | `SLACK_CHANNEL` | `#revenue-ops` | Channel name (resolved to an ID) or a literal channel/user ID |
 | `GOOGLE_SHEETS_SPREADSHEET_ID` | - | Required: destination spreadsheet ID |
 | `GOOGLE_SHEETS_TAB_NAME` | `Forecast Log` | Tab/sheet name; auto-created if missing |
@@ -199,7 +205,7 @@ Environment variables (set in `.env`):
 
 | Code | Meaning | Use Case |
 |------|---------|----------|
-| `0` | Success | Commentary posted and logged, or already processed this period (nothing to do) |
+| `0` | Success | Pipeline checked and logged to Sheets; Slack posted only if the pipeline changed since the last post |
 | `1` | Error | Config missing, provisioning failed, or 5 consecutive polling errors; investigate logs |
 | `2` | No data | No open pipeline found in either Salesforce or HubSpot this cycle (normal, not an error) |
 | `130` | Interrupted | Graceful shutdown via Ctrl+C or SIGTERM |
@@ -224,17 +230,25 @@ Log levels:
 
 ### Polling Loop
 
+Because Slack posting is gated by real pipeline change (see State below), polling mode is a genuine change detector, not a once-per-period digest: leave it running continuously and it stays quiet until Salesforce or HubSpot data actually moves, then posts.
+
 ```bash
-POLLING_MODE=true POLL_INTERVAL_MINUTES=1440 python run_flow.py   # daily
+POLLING_MODE=true POLL_INTERVAL_MINUTES=60 python run_flow.py   # check hourly
 # Ctrl+C stops after the current cycle finishes, exit code 130
 ```
 
 ### State
 
-Processed `(analyst, forecast_period)` cycles are stored in `state/processed_periods.json`, so re-running the agent for a period you've already processed won't re-post to Slack. Google Sheets logging is append-only, so each successful cycle adds a fresh snapshot row per stage regardless of state; the state guard exists specifically to protect the Slack post, the most visible side effect, from being duplicated.
+Every cycle fetches fresh data from Salesforce and HubSpot and logs a snapshot row to Google Sheets (append-only, safe to run any number of times). Whether Slack gets a new post is decided separately: `state.py` computes a content fingerprint over each stage's deal count, total value, and at-risk flag, and only posts to Slack when that fingerprint differs from the last one posted for this analyst. This means:
+
+- Running the agent repeatedly with unchanged pipeline data logs a fresh Sheets row each time but never re-posts the same commentary to Slack.
+- A new deal, a stage move, an amount change, or a stage newly (or no longer) flagged at-risk changes the fingerprint and triggers a fresh Slack post on the next cycle.
+- `FORECAST_PERIOD` is not part of this decision; it is purely a display label.
+
+The last-posted fingerprint per analyst is stored in `state/processed_periods.json`.
 
 ```bash
-rm -f state/processed_periods.json   # reset, e.g. to re-post for testing
+rm -f state/processed_periods.json   # reset, e.g. to force a re-post for testing
 ```
 
 ## Error Handling & Edge Cases
@@ -267,62 +281,3 @@ rm -f state/processed_periods.json   # reset, e.g. to re-post for testing
 | `Could not resolve Slack channel '...'` | The channel name search returned no results; double-check spelling, or use a literal channel ID (`C...`) instead |
 | Google Sheets row missing expected header | The header row is only written once, the first time the tab is empty; if you manually cleared the tab's values, the next run re-writes it |
 | `No colored output` | Colors auto-disable when output is piped; force with `FORCE_COLOR=1` |
-
-## Deployment
-
-### Cron (recommended for weekly cadence)
-
-```bash
-crontab -e
-# Weekly forecast commentary, Monday 9am
-0 9 * * MON cd /path/to/revenue-forecast-commentary-agent && /path/to/.venv/bin/python run_flow.py >> /var/log/forecast-agent.log 2>&1
-```
-
-### systemd (for polling mode)
-
-```ini
-[Unit]
-Description=Revenue Forecast Commentary Agent
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/path/to/revenue-forecast-commentary-agent
-EnvironmentFile=/path/to/revenue-forecast-commentary-agent/.env
-ExecStart=/path/to/.venv/bin/python run_flow.py
-Environment=POLLING_MODE=true
-Environment=POLL_INTERVAL_MINUTES=10080
-Restart=on-failure
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### Docker
-
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-CMD ["python", "run_flow.py"]
-```
-
-```bash
-docker build -t revenue-forecast-commentary-agent .
-docker run --env-file .env revenue-forecast-commentary-agent
-```
-
-## Production Checklist
-
-- [ ] All four Scalekit connections (Salesforce, HubSpot, SlackMCP, Google Sheets) show `ACTIVE` for the identities configured in `.env`
-- [ ] `SALESFORCE_CONNECTOR` / `HUBSPOT_CONNECTOR` / `SLACK_CONNECTOR` / `GOOGLE_SHEETS_CONNECTOR` are set to the exact per-workspace connection names, not generic provider labels
-- [ ] `GOOGLE_SHEETS_SPREADSHEET_ID` points at a real, accessible spreadsheet created in advance
-- [ ] `SLACK_CHANNEL` resolves to a real channel the connected account is a member of (check logs for "Could not resolve Slack channel")
-- [ ] `QUOTA_TARGET` and `COVERAGE_RATIO_TARGET` reflect your team's real quota and risk threshold, not the defaults
-- [ ] `state/processed_periods.json` is on persistent storage if deploying to an ephemeral container, so restarts don't re-post a duplicate commentary mid-week
-- [ ] `OPENROUTER_API_KEY` data-flow implications reviewed and accepted (or deliberately left unset) per your organization's data-handling policy
-- [ ] Cron/systemd schedule matches your team's actual forecast cadence (weekly is the documented default)
-- [ ] Logs are shipped somewhere durable (`>> file.log`, journald, or a log aggregator) since `state/` alone won't tell you *why* a cycle skipped or failed

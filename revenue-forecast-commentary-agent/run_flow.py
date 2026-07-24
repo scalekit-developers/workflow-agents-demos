@@ -8,6 +8,13 @@ view, calculates a coverage ratio against a configured quota target, flags
 at-risk stages, drafts commentary (rule-based, with an optional LLM polish
 pass), posts it to Slack, and logs a snapshot row per stage to Google Sheets.
 
+Every cycle always fetches fresh data and logs a snapshot row to Google
+Sheets. Slack is only posted to when the pipeline has actually changed since
+the last post for this analyst (a content fingerprint over stage counts,
+values, and at-risk flags), so polling mode behaves as a real change
+detector rather than a once-per-calendar-period digest: run it continuously
+and it stays quiet until something in Salesforce or HubSpot actually moves.
+
 Scalekit Agent Auth handles OAuth for all four connectors -- token storage,
 refresh, and every API call go through actions.execute_tool(). No manual
 token management, no direct API imports.
@@ -18,7 +25,7 @@ Setup:
   python run_flow.py           # run one forecast cycle and exit
 
 Exit codes:
-  0   = success (commentary posted, or already processed this period -- nothing to do)
+  0   = success (pipeline checked; Slack posted only if something changed)
   1   = error (config missing, provisioning failed, or 5 consecutive polling errors)
   2   = no data (no open pipeline found in either Salesforce or HubSpot this cycle)
   130 = interrupted (Ctrl+C or SIGTERM)
@@ -49,7 +56,7 @@ from connectors import (
 )
 import logging_config
 from provisioning import ProvisioningError, ensure_google_sheet_tab, resolve_hubspot_open_stages
-from state import StateManager
+from state import StateManager, compute_pipeline_fingerprint
 from summarizer import polish_commentary
 
 load_dotenv()
@@ -93,18 +100,18 @@ def run_cycle(cfg: Config, actions, state: StateManager) -> Optional[int]:
     """
     Run one full forecast cycle.
 
-    Returns the number of stage segments found (open pipeline grouped by
-    stage), or None if there was nothing to do at all (this analyst/period
-    was already processed) -- distinct from 0, which means the pipeline
-    pull succeeded but found zero open records in either CRM.
-    """
-    if state.is_processed(cfg.analyst_email, cfg.forecast_period):
-        logger.info(
-            f"Analyst '{cfg.analyst_email}' / period '{cfg.forecast_period}' already "
-            f"processed -- skipping (delete state/processed_periods.json to reprocess)"
-        )
-        return None
+    Always fetches and logs the current pipeline snapshot to Google Sheets
+    (append-only, safe to run repeatedly). Posts to Slack only when the
+    pipeline has actually changed since the last post for this analyst --
+    a new deal, a stage move, an amount change, or a change in which stages
+    are flagged at-risk -- rather than once per calendar period. This makes
+    polling mode a real change detector: unchanged data across polls stays
+    silent, and any real movement in Salesforce/HubSpot triggers a fresh post.
 
+    Returns the number of stage segments found (open pipeline grouped by
+    stage), or None if there was no open pipeline at all to report on --
+    distinct from 0, which means data unchanged since the last Slack post.
+    """
     salesforce = SalesforceConnector(actions, cfg.salesforce_user, cfg.salesforce_connector)
     hubspot = HubSpotConnector(actions, cfg.hubspot_user, cfg.hubspot_connector)
     slack = SlackConnector(actions, cfg.slack_user, cfg.slack_connector)
@@ -135,7 +142,7 @@ def run_cycle(cfg: Config, actions, state: StateManager) -> Optional[int]:
 
     if not sf_records and not hs_deals:
         logger.warning("No open pipeline found in Salesforce or HubSpot this cycle")
-        return 0
+        return None
 
     logger.info("Step 2: Calculating coverage ratio and flagging at-risk stages")
     segments = build_stage_segments(sf_records, hs_deals, open_stage_labels)
@@ -162,20 +169,28 @@ def run_cycle(cfg: Config, actions, state: StateManager) -> Optional[int]:
         commentary, cfg.forecast_period, cfg.openrouter_api_key, cfg.openrouter_model
     )
 
-    logger.info("Step 3: Posting commentary to Slack")
-    channel_id = slack.resolve_channel_id(cfg.slack_channel)
-    if channel_id:
-        try:
-            slack.send_message(channel_id, commentary)
-            logger.info(f"[OK] Commentary posted to Slack ({cfg.slack_channel} -> {channel_id})")
-        except ConnectorError as e:
-            logger.warning(f"Failed to post Slack commentary: {e}")
-    else:
-        logger.warning(
-            f"Could not resolve Slack channel '{cfg.slack_channel}' -- skipping Slack post. "
-            f"Set SLACK_CHANNEL to a channel that exists in your workspace, or a literal "
-            f"channel/user ID."
+    fingerprint = compute_pipeline_fingerprint(segments, at_risk_flags)
+    if not state.has_changed(cfg.analyst_email, fingerprint):
+        logger.info(
+            f"Pipeline unchanged since the last Slack post for '{cfg.analyst_email}' "
+            f"-- skipping Slack (delete state/processed_periods.json to force a re-post)"
         )
+    else:
+        logger.info("Step 3: Posting commentary to Slack (pipeline changed since last post)")
+        channel_id = slack.resolve_channel_id(cfg.slack_channel)
+        if channel_id:
+            try:
+                slack.send_message(channel_id, commentary)
+                logger.info(f"[OK] Commentary posted to Slack ({cfg.slack_channel} -> {channel_id})")
+                state.mark_posted(cfg.analyst_email, fingerprint)
+            except ConnectorError as e:
+                logger.warning(f"Failed to post Slack commentary: {e}")
+        else:
+            logger.warning(
+                f"Could not resolve Slack channel '{cfg.slack_channel}' -- skipping Slack post. "
+                f"Set SLACK_CHANNEL to a channel that exists in your workspace, or a literal "
+                f"channel/user ID."
+            )
 
     logger.info("Step 4: Logging pipeline snapshot to Google Sheets")
     run_date = __import__("datetime").date.today().isoformat()
@@ -201,7 +216,6 @@ def run_cycle(cfg: Config, actions, state: StateManager) -> Optional[int]:
 
     logger.info(f"[OK] Logged {rows_written}/{len(segments)} stage row(s) to Google Sheets")
 
-    state.mark_processed(cfg.analyst_email, cfg.forecast_period)
     return len(segments)
 
 
@@ -247,10 +261,10 @@ def main() -> int:
             try:
                 count = run_cycle(cfg, actions, state)
                 consecutive_errors = 0
-                if count:
-                    logger.info(f"[OK] Processed {count} stage segment(s)")
+                if count is None:
+                    logger.info("No open pipeline found this cycle")
                 else:
-                    logger.info("Nothing new to process this cycle")
+                    logger.info(f"[OK] Checked {count} stage segment(s) this cycle")
             except Exception as e:
                 consecutive_errors += 1
                 logger.error(f"Error during cycle: {e}", exc_info=True)
@@ -267,12 +281,10 @@ def main() -> int:
     else:
         count = run_cycle(cfg, actions, state)
         if count is None:
-            return 0
-        if count:
-            logger.info(f"[OK] Processed {count} stage segment(s)")
-            return 0
-        logger.info("No open pipeline found in Salesforce or HubSpot this cycle")
-        return 2
+            logger.info("No open pipeline found in Salesforce or HubSpot this cycle")
+            return 2
+        logger.info(f"[OK] Checked {count} stage segment(s)")
+        return 0
 
 
 def _connector_for_check(actions, connector_name: str, identifier: str):
