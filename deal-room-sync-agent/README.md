@@ -1,6 +1,6 @@
 # Deal Room Sync Agent
 
-**Salesforce + Slack -> Google Drive**
+**Salesforce + Slack -> Google Drive** 
 
 An agent that runs on behalf of an Account Executive (AE): pulls opportunity context from Salesforce (stage, amount, close date, next steps), captures key decisions from relevant Slack discussion, and syncs a running summary into the opportunity's Google Drive deal room doc as a comment log.
 
