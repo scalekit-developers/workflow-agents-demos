@@ -3,11 +3,16 @@ State management for change-detection on the forecast pipeline.
 
 Tracks a content fingerprint of the last posted pipeline snapshot per analyst,
 so the agent only posts to Slack when the underlying Salesforce/HubSpot data
-has actually changed (new deal, stage move, amount change, at-risk flag
-change) -- not just once per calendar period. Google Sheets logging is
-append-only and safe to run multiple times regardless of this guard (each
-run that reaches Step 4 adds a new snapshot row); the guard only protects the
-user-visible Slack post from being duplicated when nothing has changed.
+has actually changed at the stage-aggregate level (deal count, total value,
+at-risk flag) -- not just once per calendar period. This is aggregate,
+stage-level change detection, not per-deal detection: it has no per-deal
+identifiers, so a swap that leaves a stage's deal count and total value
+unchanged is not detected, and monetary values are rounded to whole dollars
+before fingerprinting, so sub-dollar changes are also invisible. Google
+Sheets logging is append-only and safe to run multiple times regardless of
+this guard (each run that reaches Step 4 adds a new snapshot row); the guard
+only protects the user-visible Slack post from being duplicated when nothing
+has changed at the level this fingerprint tracks.
 """
 
 import hashlib
@@ -45,7 +50,7 @@ def compute_pipeline_fingerprint(segments: Dict, at_risk_flags: Dict) -> str:
 class StateManager:
     """Tracks each analyst's last-posted pipeline fingerprint for change detection."""
 
-    def __init__(self, state_file: Path = None):
+    def __init__(self, state_file: Optional[Path] = None):
         if state_file is None:
             state_file = Path(__file__).parent / "state" / "processed_periods.json"
         self.state_file = state_file
@@ -62,8 +67,8 @@ class StateManager:
                 raw = json.loads(self.state_file.read_text())
                 self._last_fingerprint = raw if isinstance(raw, dict) else {}
                 logger.debug(f"Loaded fingerprint state for {len(self._last_fingerprint)} analyst(s)")
-            except (json.JSONDecodeError, TypeError):
-                logger.warning("State file corrupted, starting fresh")
+            except (json.JSONDecodeError, TypeError, UnicodeDecodeError, FileNotFoundError):
+                logger.warning("State file corrupted or unreadable, starting fresh")
                 self._last_fingerprint = {}
         else:
             logger.debug("No state file found, starting fresh")

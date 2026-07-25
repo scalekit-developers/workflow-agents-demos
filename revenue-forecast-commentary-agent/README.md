@@ -239,10 +239,11 @@ POLLING_MODE=true POLL_INTERVAL_MINUTES=60 python run_flow.py   # check hourly
 
 ### State
 
-Every cycle fetches fresh data from Salesforce and HubSpot and logs a snapshot row to Google Sheets (append-only, safe to run any number of times). Whether Slack gets a new post is decided separately: `state.py` computes a content fingerprint over each stage's deal count, total value, and at-risk flag, and only posts to Slack when that fingerprint differs from the last one posted for this analyst. This means:
+Every cycle fetches fresh data from Salesforce and HubSpot and logs a snapshot row to Google Sheets (append-only, safe to run any number of times). Whether Slack gets a new post is decided separately: `state.py` computes a content fingerprint per stage from the aggregate deal count, aggregate total value (rounded to whole dollars), and at-risk flag, and only posts to Slack when that fingerprint differs from the last one posted for this analyst. This is aggregate, stage-level change detection, not per-deal detection: it does not track individual deal identities. This means:
 
 - Running the agent repeatedly with unchanged pipeline data logs a fresh Sheets row each time but never re-posts the same commentary to Slack.
-- A new deal, a stage move, an amount change, or a stage newly (or no longer) flagged at-risk changes the fingerprint and triggers a fresh Slack post on the next cycle.
+- A change to a stage's deal count or total value, or a stage newly (or no longer) flagged at-risk, changes the fingerprint and triggers a fresh Slack post on the next cycle.
+- A swap that leaves a stage's deal count and total value unchanged (e.g. one deal leaves a stage while a different deal of the same value enters it) will NOT be detected, since the fingerprint has no per-deal identifiers. Sub-dollar amount changes are also invisible, since values are rounded to whole dollars before fingerprinting.
 - `FORECAST_PERIOD` is not part of this decision; it is purely a display label.
 
 The last-posted fingerprint per analyst is stored in `state/processed_periods.json`.

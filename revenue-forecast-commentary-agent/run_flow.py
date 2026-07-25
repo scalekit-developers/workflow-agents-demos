@@ -10,10 +10,14 @@ pass), posts it to Slack, and logs a snapshot row per stage to Google Sheets.
 
 Every cycle always fetches fresh data and logs a snapshot row to Google
 Sheets. Slack is only posted to when the pipeline has actually changed since
-the last post for this analyst (a content fingerprint over stage counts,
-values, and at-risk flags), so polling mode behaves as a real change
-detector rather than a once-per-calendar-period digest: run it continuously
-and it stays quiet until something in Salesforce or HubSpot actually moves.
+the last post for this analyst, at the stage-aggregate level: a content
+fingerprint over each stage's deal count, total value (rounded to whole
+dollars), and at-risk flag. This is aggregate detection, not per-deal
+detection -- a deal swap that leaves a stage's count and value unchanged, or
+a sub-dollar amount change, will not trigger a post. Polling mode behaves as
+a real change detector rather than a once-per-calendar-period digest for
+changes at this granularity: run it continuously and it stays quiet until a
+stage's aggregate numbers actually move.
 
 Scalekit Agent Auth handles OAuth for all four connectors -- token storage,
 refresh, and every API call go through actions.execute_tool(). No manual
@@ -182,6 +186,12 @@ def run_cycle(cfg: Config, actions, state: StateManager) -> Optional[int]:
             try:
                 slack.send_message(channel_id, commentary)
                 logger.info(f"[OK] Commentary posted to Slack ({cfg.slack_channel} -> {channel_id})")
+                # If the process is killed here, before mark_posted() writes to
+                # disk, the next run will see this fingerprint as unposted and
+                # send one duplicate Slack message. Accepted as a narrow,
+                # low-consequence crash-window race rather than adding
+                # idempotency-key/rollback machinery for a single duplicate
+                # message on process death.
                 state.mark_posted(cfg.analyst_email, fingerprint)
             except ConnectorError as e:
                 logger.warning(f"Failed to post Slack commentary: {e}")
