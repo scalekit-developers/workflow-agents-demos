@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+state/briefed_mentions.json
+.DS_Store
