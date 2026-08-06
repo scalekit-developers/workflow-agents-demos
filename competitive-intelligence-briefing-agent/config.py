@@ -5,11 +5,12 @@ All settings loaded from environment variables.
 Validates on startup and provides clear error messages.
 """
 
+import logging
 import os
 import sys
-from typing import Dict, List, Optional
+from typing import List, Optional, Tuple
 
-logger = None  # Set by run_flow after logging is initialized
+logger = logging.getLogger(__name__)
 
 
 class Config:
@@ -107,27 +108,26 @@ class Config:
 
         if errors:
             msg = f"Missing required config: {', '.join(errors)}"
-            if logger:
-                logger.error(msg)
-            else:
-                print(f"ERROR: {msg}")
+            logger.error(msg)
             sys.exit(1)
 
         if not self.competitor_names:
             msg = "COMPETITOR_NAMES resolved to an empty list -- set at least one competitor name"
-            if logger:
-                logger.error(msg)
-            else:
-                print(f"ERROR: {msg}")
+            logger.error(msg)
             sys.exit(1)
 
-    def get_connector_users(self) -> Dict[str, str]:
-        """Mapping of connector name -> identifier, for auth checks."""
-        return {
-            self.gong_connector: self.gong_user,
-            self.notion_connector: self.notion_user,
-            self.slack_connector: self.slack_user,
-        }
+    def get_connector_users(self) -> List[Tuple[str, str]]:
+        """
+        List of (connector name, identifier) pairs, for auth checks. A list
+        rather than a dict so two connectors that happen to share the same
+        connection name (e.g. a misconfigured .env) both still get checked,
+        instead of one silently overwriting the other as a dict key would.
+        """
+        return [
+            (self.gong_connector, self.gong_user),
+            (self.notion_connector, self.notion_user),
+            (self.slack_connector, self.slack_user),
+        ]
 
     @staticmethod
     def _parse_list(key: str) -> Optional[List[str]]:
@@ -137,24 +137,18 @@ class Config:
         return [item.strip() for item in raw.split(",") if item.strip()]
 
     @staticmethod
-    def _parse_int(key: str, default: int, min_value: int = None) -> int:
+    def _parse_int(key: str, default: int, min_value: Optional[int] = None) -> int:
         raw = os.environ.get(key, str(default))
         try:
             value = int(raw)
         except ValueError:
             msg = f"Invalid {key}: {raw!r} (must be an integer)"
-            if logger:
-                logger.error(msg)
-            else:
-                print(f"ERROR: {msg}")
+            logger.error(msg)
             sys.exit(1)
 
         if min_value is not None and value < min_value:
             msg = f"{key} must be >= {min_value}, got {value}"
-            if logger:
-                logger.error(msg)
-            else:
-                print(f"ERROR: {msg}")
+            logger.error(msg)
             sys.exit(1)
 
         return value

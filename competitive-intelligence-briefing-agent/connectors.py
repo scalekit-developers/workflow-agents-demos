@@ -32,7 +32,7 @@ not guessed:
          parent, and what provisioning.py uses as its reachability check.
   - slackmcp_slack_search_users(query=)                            (SLACKMCP,
         connector "slackmcp")
-      -> Verified live: query="parv" returned a markdown "results" string
+      -> Verified live: a name query returned a markdown "results" string
          (not structured JSON) listing Name/User ID/Email/Permalink blocks,
          same markdown-search-result shape as slackmcp_slack_search_channels
          in the sibling repos.
@@ -84,19 +84,16 @@ not guessed:
           REST GET/POST for resolving a Gong user ID on a call's parties
           list to an email address, used to identify the rep.
 
-    GONG has NO connected account in this workspace as of this build (verified
-    live: get_or_create_connected_account raises RESOURCE_NOT_FOUND for every
-    plausible connection name against both parv@infrasity.com and
-    team@infrasity.com). This means the tool NAMES and SHAPES above are
-    confirmed real (pulled straight from Scalekit's own tool catalog, not
-    guessed), but the actual DATA these tools would return has never been
-    exercised end-to-end in this workspace. GongConnector is built fully
-    against these confirmed shapes; run_flow.py still treats any Gong call at
-    runtime as capable of failing with a clear, specific, actionable error
-    (see ConnectorUnavailableError below and Step 1 in run_flow.py), since a
-    catalog entry existing is not the same guarantee as a working connected
-    account. See README Prerequisites for exactly what connecting GONG in the
-    Scalekit dashboard requires before this is exercised for real.
+    The tool NAMES and SHAPES above are confirmed real (pulled straight from
+    Scalekit's own tool catalog, not guessed) and have since been re-verified
+    against real call data once a Gong connection was authorized in this
+    workspace. GongConnector is built against these confirmed shapes;
+    run_flow.py still treats any Gong call at runtime as capable of failing
+    with a clear, specific, actionable error (see ConnectorUnavailableError
+    below and Step 1 in run_flow.py), since a working connection today is not
+    a guarantee it stays authorized on every future run. See README
+    Prerequisites for exactly what connecting GONG in the Scalekit dashboard
+    requires.
 """
 
 import json
@@ -246,9 +243,8 @@ class GongConnector(Connector):
     Gong user IDs to emails.
 
     Tool names/shapes are verified against Scalekit's live tool catalog (see
-    module docstring) but GONG has zero connected accounts in this workspace
-    as of this build, so no method here has been exercised against real Gong
-    data. Every method raises ConnectorUnavailableError (via execute_tool's
+    module docstring) and against real Gong call data once connected. Every
+    method raises ConnectorUnavailableError (via execute_tool's
     RESOURCE_NOT_FOUND handling) rather than crashing with a raw SDK
     exception if called before GONG is connected -- callers (run_flow.py
     Step 1) are expected to catch that specifically and fail with a clear,
@@ -289,6 +285,13 @@ class GongConnector(Connector):
             cursor = page.get("cursor") or (page.get("records") or {}).get("cursor")
             if not cursor:
                 break
+        else:
+            logger.warning(
+                f"Reached max_pages={max_pages} while Gong still had more calls "
+                f"(cursor present) -- results are truncated at {len(calls)} call(s). "
+                f"Narrow LOOKBACK_DAYS or raise max_pages if this window is expected "
+                f"to have this many calls."
+            )
         return calls
 
     def get_calls_extensive(self, call_ids: List[str]) -> List[Dict]:
@@ -479,13 +482,16 @@ class SlackConnector(Connector):
 def _extract_user_id_matching(results_text: str, query: str) -> Optional[str]:
     """
     Parse a Slack user ID out of SlackMCP's markdown search-results text,
-    e.g. "...Name: Parv Mittal\\nUser ID: U09LJ4LPSDU\\nEmail: parv@x.com...".
+    e.g. "...Name: Jane Doe\\nUser ID: U0EXAMPLE1\\nEmail: jane@example.com...".
 
-    When the query looks like an email, prefer the result block whose Email
-    line matches it exactly (search_users can return multiple partial-name
-    matches, as verified live for query="parv" returning two different
-    people) -- falling back to the first block's user ID if no exact email
-    match is found, since a fuzzy name search has no better tiebreaker.
+    When the query looks like an email, ONLY the result block whose Email
+    line matches it exactly is used (search_users can return multiple
+    partial-name matches, as verified live for a first-name query returning
+    two different people) -- an email query with no exact match returns None
+    rather than falling back to an arbitrary first result, since silently
+    DMing the wrong person on an email lookup is worse than skipping the rep.
+    The first-block fallback is reserved for name queries, where a fuzzy
+    match has no better tiebreaker anyway.
     """
     blocks = re.split(r"\n---\n", results_text or "")
     query_lower = query.strip().lower()
@@ -497,6 +503,7 @@ def _extract_user_id_matching(results_text: str, query: str) -> Optional[str]:
                 user_id_match = re.search(r"User ID:\s*(\w+)", block)
                 if user_id_match:
                     return user_id_match.group(1)
+        return None
 
     first_match = re.search(r"User ID:\s*(\w+)", results_text or "")
     return first_match.group(1) if first_match else None

@@ -226,7 +226,7 @@ Log levels:
 
 Every cycle ends with a summary line:
 
-```
+```text
 [SUMMARY] 3 rep(s) briefed, 1 already briefed (idempotent skip), 1 skipped (no Slack user), 0 skipped (send failed), 2 battlecard(s) found, 1 missing
 ```
 
@@ -264,4 +264,4 @@ rm -f state/briefed_mentions.json   # reset, e.g. to force re-briefing for testi
 | No battlecard link in a rep's DM | Confirm a Notion child page titled (or containing) the competitor's exact name exists under your configured parent page |
 | Rep never gets DMed | Check logs for `skipped_no_slack_user` -- the rep's Gong-identified email/name didn't resolve to a Slack user; try setting up the rep's email as their Gong participant identity |
 | Same rep DMed twice for the same mention | Should not happen -- if it does, check `state/briefed_mentions.json` is writable and not being reset between runs |
-| `No colored output` | Colors auto-disable when output is piped; force with `FORCE_COLOR=1` |
+| `No colored output` | Colors auto-disable when output is piped or redirected (not a TTY) -- this is expected, not a bug; run interactively in a terminal to see colors |

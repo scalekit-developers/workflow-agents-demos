@@ -2,5 +2,5 @@
 __pycache__/
 *.pyc
 .venv/
-state/briefed_mentions.json
+state/
 .DS_Store

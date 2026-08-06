@@ -20,22 +20,24 @@ def _is_tty() -> bool:
     return sys.stdout.isatty()
 
 
+_REDACTION_PATTERNS = [
+    (re.compile(r'sk[_-][\w-]{20,}', re.IGNORECASE), '***REDACTED***'),
+    (re.compile(r'skc_[\w-]+', re.IGNORECASE), '***REDACTED***'),
+    (re.compile(r'test_[\w-]{20,}', re.IGNORECASE), '***REDACTED***'),
+    (re.compile(r'Bearer\s+[\w-]+', re.IGNORECASE), 'Bearer ***REDACTED***'),
+    (re.compile(r'Authorization:\s+[\w-]+', re.IGNORECASE), 'Authorization: ***REDACTED***'),
+    (re.compile(r'"token":\s*"[^"]*"', re.IGNORECASE), '"token": "***REDACTED***"'),
+    (re.compile(r'"access_token":\s*"[^"]*"', re.IGNORECASE), '"access_token": "***REDACTED***"'),
+    (re.compile(r'"api_key":\s*"[^"]*"', re.IGNORECASE), '"api_key": "***REDACTED***"'),
+]
+
+
 def _redact_secrets(text: str) -> str:
     """Replace common secrets with ***REDACTED***."""
     if not isinstance(text, str):
         return text
-    patterns = [
-        (r'sk[_-][\w-]{20,}', '***REDACTED***'),
-        (r'skc_[\w-]+', '***REDACTED***'),
-        (r'test_[\w-]{20,}', '***REDACTED***'),
-        (r'Bearer\s+[\w-]+', 'Bearer ***REDACTED***'),
-        (r'Authorization:\s+[\w-]+', 'Authorization: ***REDACTED***'),
-        (r'"token":\s*"[^"]*"', '"token": "***REDACTED***"'),
-        (r'"access_token":\s*"[^"]*"', '"access_token": "***REDACTED***"'),
-        (r'"api_key":\s*"[^"]*"', '"api_key": "***REDACTED***"'),
-    ]
-    for pattern, replacement in patterns:
-        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    for pattern, replacement in _REDACTION_PATTERNS:
+        text = pattern.sub(replacement, text)
     return text
 
 
@@ -58,7 +60,7 @@ class ColorFormatter(logging.Formatter):
     def format(self, record):
         timestamp = datetime.datetime.fromtimestamp(
             record.created, datetime.timezone.utc
-        ).strftime('%H:%M:%S')
+        ).strftime('%H:%M:%SZ')
 
         levelname = record.levelname
         if self.use_color:
@@ -93,7 +95,8 @@ def setup_logging(name: str = __name__) -> logging.Logger:
       - Secret redaction
     """
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, log_level, logging.INFO)
+    valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+    level = getattr(logging, log_level) if log_level in valid_levels else logging.INFO
 
     root_logger = logging.getLogger()
     root_logger.setLevel(level)

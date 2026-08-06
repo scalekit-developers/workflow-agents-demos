@@ -11,8 +11,9 @@ A "competitor mention" on a call is detected two ways, in priority order:
   1. Tracker hits: if get_calls_extensive() returns a content.trackers list
      for the call (Gong's tracker-hit signal, see connectors.py module
      docstring) and a tracker's name matches a configured competitor name
-     (case-insensitive substring match, e.g. tracker "Salesforce mention"
-     matches competitor "Salesforce"), that's a mention.
+     via _word_matches (case-insensitive whole-word match, e.g. tracker
+     "Salesforce mention" matches competitor "Salesforce" but "Sales" does
+     not), that's a mention.
   2. Transcript text fallback: if a call has no matching tracker hit (either
      because no Gong tracker exists for that competitor, or tracker data
      wasn't returned), the call's transcript text is scanned for the
@@ -24,12 +25,13 @@ build_rep_digests below), not multiple separate DMs.
 
 Rep identification
 --------------------
-The sales rep on a call is the internal participant who is not the PMM
-running this agent and not an external (prospect/customer) party --
-approximated here as the first Gong "party" whose affiliation is "Internal"
-(or whose email domain matches the PMM's own domain, as a fallback when
-affiliation metadata is absent). A call with no identifiable internal
-participant is skipped with a warning (see build_rep_digests) rather than
+Scalekit's gong_calls_get tool has no way to request Gong's "parties"
+(participant) data -- its input schema only accepts call_ids and
+workspace_id, confirmed by reading the tool's own jsonnet_template. The
+real, working path is each call's metaData.primaryUserId, resolved in one
+batch via gong_users_get to a name/email (see identify_rep and
+GongConnector.build_user_lookup). A call whose primaryUserId cannot be
+resolved is skipped with a warning (see build_rep_digests) rather than
 guessed at, since DMing the wrong person is worse than skipping one call.
 """
 
@@ -145,6 +147,8 @@ def detect_mentions_from_transcript(
 
     hits: Dict[str, Optional[int]] = {}
     for sentence in transcript_sentences:
+        if len(hits) >= len(competitor_names):
+            break
         if not isinstance(sentence, dict):
             continue
         text = sentence.get("text", "")
@@ -195,9 +199,12 @@ def identify_rep(
     if no internal participant can be identified by any path -- callers
     must skip the call with a warning rather than guess.
     """
-    parties = (call_detail.get("parties") or call_detail.get("content") or {}).get("parties", None)
-    if parties is None:
-        parties = call_detail.get("parties") or []
+    top_level_parties = call_detail.get("parties")
+    if top_level_parties:
+        parties = top_level_parties
+    else:
+        content = call_detail.get("content")
+        parties = content.get("parties") or [] if isinstance(content, dict) else []
 
     candidates = [p for p in parties if isinstance(p, dict) and p.get("affiliation") == "Internal"]
 

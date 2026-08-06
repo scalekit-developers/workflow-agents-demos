@@ -48,6 +48,7 @@ format itself changes (documented limitation, see README).
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Optional, Set
 
@@ -86,7 +87,7 @@ class StateManager:
                 raw = json.loads(self.state_file.read_text())
                 self._briefed = set(raw) if isinstance(raw, list) else set()
                 logger.debug(f"Loaded {len(self._briefed)} previously-briefed mention(s)")
-            except (json.JSONDecodeError, TypeError, UnicodeDecodeError, FileNotFoundError):
+            except (json.JSONDecodeError, TypeError, UnicodeDecodeError, OSError):
                 logger.warning("State file corrupted or unreadable, starting fresh")
                 self._briefed = set()
         else:
@@ -94,9 +95,20 @@ class StateManager:
             self._briefed = set()
 
     def save(self) -> None:
+        """
+        Write the ledger atomically: write to a temp file, flush and fsync it
+        so the data is actually durable on disk (not just buffered) before
+        the atomic rename, then replace the real state file. Without the
+        fsync, a crash or power loss right after a successful DM send could
+        lose the just-written "briefed" marks despite the DM having already
+        gone out, causing a duplicate DM on the next run.
+        """
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(sorted(self._briefed), indent=2))
+        with open(tmp, "w") as f:
+            f.write(json.dumps(sorted(self._briefed), indent=2))
+            f.flush()
+            os.fsync(f.fileno())
         tmp.replace(self.state_file)  # atomic on POSIX
 
     def is_briefed(self, key: str) -> bool:

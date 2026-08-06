@@ -12,12 +12,12 @@ Scalekit Agent Auth handles OAuth for all three connectors -- token storage,
 refresh, and every API call go through actions.execute_tool(). No manual
 token management, no direct API imports.
 
-Gong availability: as of this build, GONG has zero connected accounts in the
-reference Scalekit workspace this agent was developed against. Step 0 and
-Step 0.5 report this without crashing (Gong's availability is a per-run data
-condition, not a static config error -- see provisioning.py); Step 1 is
-where a genuinely unreachable Gong produces a specific, actionable failure
-with exit code 1. See README Prerequisites for what connecting GONG requires.
+Gong availability: Step 0 and Step 0.5 report Gong's connector status
+without crashing if it is ever unauthorized or unreachable (Gong's
+availability is a per-run data condition, not a static config error -- see
+provisioning.py); Step 1 is where a genuinely unreachable Gong produces a
+specific, actionable failure with exit code 1. See README Prerequisites for
+what connecting GONG requires.
 
 Setup:
   cp .env.example .env        # fill in your credentials
@@ -43,10 +43,10 @@ from typing import Dict, List, Optional, Tuple
 import scalekit.client
 from dotenv import load_dotenv
 
-from aggregator import RepDigest, build_rep_digests, render_digest_text
-import config as config_module
+from aggregator import RepDigest, build_rep_digests, detect_mentions_from_trackers, render_digest_text
 from config import Config
 from connectors import (
+    Connector,
     ConnectorError,
     ConnectorUnavailableError,
     GongConnector,
@@ -59,7 +59,6 @@ from state import StateManager, compute_mention_key
 
 load_dotenv()
 logger = logging_config.setup_logging(__name__)
-config_module.logger = logger
 
 _shutdown_requested = False
 
@@ -125,13 +124,25 @@ def fetch_calls_with_mentions(gong: GongConnector, cfg: Config) -> List[Dict]:
         return []
 
     details: List[Dict] = []
+    any_batch_succeeded = False
     batch_size = 20  # conservative batch size for gong_calls_get; Gong's real API caps batch calls
     for i in range(0, len(call_ids), batch_size):
         batch = call_ids[i : i + batch_size]
         try:
             details.extend(gong.get_calls_extensive(batch))
+            any_batch_succeeded = True
         except ConnectorError as e:
             logger.warning(f"Failed to fetch extensive details for a batch of {len(batch)} call(s): {e}")
+
+    if not any_batch_succeeded:
+        # Every batch failed -- this is Gong being unreachable mid-fetch, not
+        # a real "zero calls" outcome. Raising lets main() report it as the
+        # same specific, actionable Gong failure as Step 1's initial fetch,
+        # instead of silently exiting 2 as if nothing was ever mentioned.
+        raise ConnectorError(
+            f"Failed to fetch extensive call details for all {len(call_ids)} call(s) across "
+            f"{len(range(0, len(call_ids), batch_size))} batch(es); Gong may be unreachable"
+        )
 
     return details
 
@@ -147,21 +158,25 @@ def fetch_transcripts_for_fallback(gong: GongConnector, calls_needing_transcript
     if not calls_needing_transcript:
         return {}
 
-    try:
-        raw = gong.get_transcripts(calls_needing_transcript)
-    except ConnectorError as e:
-        logger.warning(f"Failed to fetch transcripts for {len(calls_needing_transcript)} call(s): {e}")
-        return {}
-
     result: Dict[str, List[Dict]] = {}
-    for entry in raw:
-        call_id = str(entry.get("callId") or entry.get("call_id") or "")
-        if not call_id:
+    batch_size = 20  # same conservative batch size as get_calls_extensive; one failing batch shouldn't drop the rest
+    for i in range(0, len(calls_needing_transcript), batch_size):
+        batch = calls_needing_transcript[i : i + batch_size]
+        try:
+            raw = gong.get_transcripts(batch)
+        except ConnectorError as e:
+            logger.warning(f"Failed to fetch transcripts for a batch of {len(batch)} call(s): {e}")
             continue
-        sentences = []
-        for transcript_part in entry.get("transcript") or []:
-            sentences.extend(transcript_part.get("sentences") or [])
-        result[call_id] = sentences
+
+        for entry in raw:
+            call_id = str(entry.get("callId") or entry.get("call_id") or "")
+            if not call_id:
+                continue
+            sentences = []
+            for transcript_part in entry.get("transcript") or []:
+                sentences.extend(transcript_part.get("sentences") or [])
+            result[call_id] = sentences
+
     return result
 
 
@@ -297,11 +312,14 @@ def run_cycle(cfg: Config, actions, state: StateManager) -> Optional[int]:
 
     # Fallback transcript scan only for calls that produced zero tracker-based
     # mentions across every rep -- keeps the common case (tracker hits already
-    # resolve mentions) cheap.
+    # resolve mentions) cheap. Reuses detect_mentions_from_trackers itself
+    # (not just "does content.trackers exist") so a call whose trackers are
+    # all for other, untracked topics also correctly falls through to the
+    # transcript scan instead of being silently dropped.
     calls_needing_fallback = [
         str((c.get("metaData") or c.get("meta") or c).get("id") or c.get("id"))
         for c in calls_with_details
-        if not (c.get("content") or {}).get("trackers") and not c.get("trackers")
+        if not detect_mentions_from_trackers(c, cfg.competitor_names)
     ]
     if calls_needing_fallback:
         transcripts = fetch_transcripts_for_fallback(gong, calls_needing_fallback)
@@ -328,6 +346,8 @@ def run_cycle(cfg: Config, actions, state: StateManager) -> Optional[int]:
             cfg, notion, slack, state, digest, battlecard_cache, cfg.notion_battlecards_parent_page_id
         )
         outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        if outcome != "briefed":
+            logger.debug(f"{digest.rep_display_name}: {outcome} -- {detail}")
 
     battlecards_found = sum(1 for v in battlecard_cache.values() if v)
     battlecards_missing = sum(1 for v in battlecard_cache.values() if not v)
@@ -351,8 +371,8 @@ def main() -> int:
 
     logger.info("Step 0: Checking connector auth")
     all_active = True
-    for connector_name, identifier in cfg.get_connector_users().items():
-        conn = _connector_for_check(actions, connector_name, identifier)
+    for connector_name, identifier in cfg.get_connector_users():
+        conn = Connector(actions, connector_name, identifier)
         if not conn.check_auth():
             all_active = False
 
@@ -432,12 +452,6 @@ def main() -> int:
             return 2
         logger.info(f"[OK] Processed {count} rep(s) with mentions this cycle")
         return 0
-
-
-def _connector_for_check(actions, connector_name: str, identifier: str):
-    """Lightweight wrapper just for the Step 0 auth-check loop."""
-    from connectors import Connector
-    return Connector(actions, connector_name, identifier)
 
 
 if __name__ == "__main__":

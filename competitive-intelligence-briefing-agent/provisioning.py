@@ -25,7 +25,7 @@ Step 2, after Gong data has already been fetched and processed.
 
 import logging
 
-from connectors import ConnectorError, NotionConnector
+from connectors import NotionConnector
 
 logger = logging.getLogger(__name__)
 
@@ -42,15 +42,10 @@ def verify_notion_battlecards_parent(notion: NotionConnector, parent_page_id: st
     itself, since a PMM is expected to have already set up their battlecards
     library in Notion (see README Prerequisites).
     """
-    try:
-        reachable = notion.verify_parent_page(parent_page_id)
-    except ConnectorError as e:
-        raise ProvisioningError(
-            f"Cannot reach Notion battlecards parent page '{parent_page_id}': {e}\n"
-            f"Confirm NOTION_CONNECTOR points at an ACTIVE Notion connection with "
-            f"read access to this page, and that NOTION_BATTLECARDS_PARENT_PAGE_ID "
-            f"is correct."
-        ) from e
+    # verify_parent_page() catches ConnectorError internally and returns False
+    # on any failure (see its docstring), so there is no separate "reachable
+    # but errored" exception path to handle here -- only the boolean result.
+    reachable = notion.verify_parent_page(parent_page_id)
 
     if not reachable:
         raise ProvisioningError(
