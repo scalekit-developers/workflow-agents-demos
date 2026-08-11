@@ -112,6 +112,11 @@ def parse_args(argv) -> argparse.Namespace:
 def init_config() -> Config:
     cfg = Config()
     cfg.validate()
+    # Register the exact secret value for redaction before anything else
+    # can log it (e.g. a Scalekit client init failure that echoes back its
+    # own credentials) -- pattern-based redaction alone might not catch a
+    # secret with no recognizable prefix shape.
+    logging_config.register_secret(cfg.scalekit_client_secret)
     return cfg
 
 
@@ -136,20 +141,29 @@ def run_incident_response(
     Run the five-step incident response flow for one alert. Returns a dict
     describing what was created (or, if this incident_key was already
     handled in a prior run, what was created THEN -- this function is
-    idempotent per incident_key and never re-runs a completed flow).
+    idempotent per incident_key and never re-pages on-call for the same
+    key).
 
     Raises ProvisioningError / ConnectorError for failures that should stop
     the whole run with a specific, actionable message (see main()). A
     partially-completed run (e.g. PagerDuty paged but Jira failed) is NOT
-    silently retried from scratch on the next invocation with the same
-    incident_key -- see the mid-flow failure handling below, which records
-    partial progress so a retry does not re-page on-call.
+    silently retried from scratch: on the next invocation with the same
+    incident_key, Steps 0.5/1 (resolve + page) are skipped in favor of the
+    PagerDuty details already recorded, and the flow resumes from Step 2
+    (Jira) onward -- see the "partial" handling below.
     """
     key = compute_incident_key(incident_key)
     prior = state.get_handled(key)
+    resuming_from_partial = False
     if prior:
-        logger.info(f"Incident key '{incident_key}' already handled in a prior run, returning that outcome")
-        return prior
+        if prior.get("status") == "complete":
+            logger.info(f"Incident key '{incident_key}' already fully handled in a prior run, returning that outcome")
+            return prior
+        logger.info(
+            f"Incident key '{incident_key}' has a partial prior run (failed at "
+            f"{prior.get('step_failed', 'an unknown step')}) -- resuming without re-paging PagerDuty"
+        )
+        resuming_from_partial = True
 
     pagerduty = PagerDutyConnector(actions, cfg.pagerduty_user, cfg.pagerduty_connector)
     jira = JiraConnector(actions, cfg.jira_user, cfg.jira_connector)
@@ -157,26 +171,37 @@ def run_incident_response(
     slack = SlackConnector(actions, cfg.slack_user, cfg.slack_connector)
 
     logger.info("Step 0.5: Resolving PagerDuty service and Slack channel")
+    # Still resolved even when resuming: PAGERDUTY_SERVICE_NAME is only used
+    # for Step 1 (skipped below), but the Slack channel is needed for Steps
+    # 3/4, and re-resolving both here is cheap and keeps this function's
+    # control flow uniform rather than threading a resuming-specific skip
+    # through resolve_pagerduty_service too.
     service_id = resolve_pagerduty_service(pagerduty, cfg.pagerduty_service_id, cfg.pagerduty_service_name)
     channel_id = resolve_slack_channel(slack, cfg.slack_channel)
 
     if _shutdown_requested:
         raise ShutdownRequested("Shutdown requested before paging on-call -- no incident was created")
 
-    logger.info(f"Step 1: Triggering PagerDuty page for service {service_id}")
-    urgency = SEVERITY_TO_URGENCY.get(severity, "high")
-    incident = pagerduty.create_incident(
-        title=title,
-        service_id=service_id,
-        from_email=cfg.oncall_email,
-        incident_key=incident_key,
-        urgency=urgency,
-        body_details=description or None,
-    )
-    pd_incident_id = incident.get("id")
-    pd_incident_number = incident.get("incident_number")
-    pd_incident_url = incident.get("html_url") or ""
-    logger.info(f"[OK] PagerDuty incident #{pd_incident_number} triggered ({pd_incident_id})")
+    if resuming_from_partial:
+        pd_incident_id = prior.get("pagerduty_incident_id")
+        pd_incident_number = prior.get("pagerduty_incident_number")
+        pd_incident_url = prior.get("pagerduty_incident_url") or ""
+        logger.info(f"Step 1: Skipped (PagerDuty incident #{pd_incident_number} already triggered in a prior run)")
+    else:
+        logger.info(f"Step 1: Triggering PagerDuty page for service {service_id}")
+        urgency = SEVERITY_TO_URGENCY.get(severity, "high")
+        incident = pagerduty.create_incident(
+            title=title,
+            service_id=service_id,
+            from_email=cfg.oncall_email,
+            incident_key=incident_key,
+            urgency=urgency,
+            body_details=description or None,
+        )
+        pd_incident_id = incident.get("id")
+        pd_incident_number = incident.get("incident_number")
+        pd_incident_url = incident.get("html_url") or ""
+        logger.info(f"[OK] PagerDuty incident #{pd_incident_number} triggered ({pd_incident_id})")
 
     if _shutdown_requested:
         logger.warning("Shutdown requested after paging on-call -- PagerDuty incident already exists, continuing to record its ticket")
@@ -205,6 +230,7 @@ def run_incident_response(
         state.mark_handled(key, {
             "status": "partial", "step_failed": "jira_issue_create",
             "pagerduty_incident_id": pd_incident_id, "pagerduty_incident_number": pd_incident_number,
+            "pagerduty_incident_url": pd_incident_url,
         })
         raise ConnectorError(
             f"PagerDuty incident #{pd_incident_number} was triggered, but creating the Jira "
@@ -215,6 +241,23 @@ def run_incident_response(
         ) from e
 
     jira_key = jira_issue.get("key") or jira_issue.get("id")
+    if not jira_key:
+        # A 2xx response with no usable key/id is malformed beyond what
+        # this agent can recover from -- treat it the same as a create
+        # failure (record partial progress, raise a specific error) rather
+        # than let html.escape(None) crash further down with a raw
+        # TypeError.
+        state.mark_handled(key, {
+            "status": "partial", "step_failed": "jira_issue_create",
+            "pagerduty_incident_id": pd_incident_id, "pagerduty_incident_number": pd_incident_number,
+            "pagerduty_incident_url": pd_incident_url,
+        })
+        raise ConnectorError(
+            f"PagerDuty incident #{pd_incident_number} was triggered, but Jira's create "
+            f"response had no usable 'key' or 'id' field: {jira_issue!r}\n"
+            f"This is unexpected -- check Jira's own status, then re-run with the same "
+            f"--incident-key -- PagerDuty will not be re-paged."
+        )
     # Jira's create response only carries the API's cloud UUID (in "self",
     # e.g. https://api.atlassian.com/ex/jira/{cloud_id}/...), never the
     # site's real human-readable subdomain -- constructing a browse URL from
@@ -232,7 +275,7 @@ def run_incident_response(
     except ConnectorError as e:
         logger.warning(f"Could not link Jira ticket back onto the PagerDuty incident (non-fatal): {e}")
 
-    logger.info(f"Step 3: Notifying on-call Slack channel")
+    logger.info("Step 3: Notifying on-call Slack channel")
     # Slack markdown link syntax <url|label> (verified live in the sibling
     # repos) renders a clickable label instead of a raw pasted URL, for
     # every link that actually has one -- PagerDuty's html_url always does;

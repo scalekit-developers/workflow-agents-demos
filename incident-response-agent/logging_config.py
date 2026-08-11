@@ -32,10 +32,27 @@ _REDACTION_PATTERNS = [
 ]
 
 
+_exact_secrets = []  # populated by register_secret(); redacted in addition to the pattern-based rules below
+
+
+def register_secret(value: str) -> None:
+    """
+    Register an exact secret value (e.g. SCALEKIT_CLIENT_SECRET) for
+    redaction, in addition to the pattern-based rules below. Pattern
+    matching alone only catches secrets with a recognizable shape (sk-,
+    Bearer, test_, ...); a secret with no such prefix would otherwise be
+    logged in full if it ever appeared in an SDK exception message.
+    """
+    if value and value.strip():
+        _exact_secrets.append(value.strip())
+
+
 def _redact_secrets(text: str) -> str:
     """Replace common secrets with ***REDACTED***."""
     if not isinstance(text, str):
         return text
+    for secret in _exact_secrets:
+        text = text.replace(secret, '***REDACTED***')
     for pattern, replacement in _REDACTION_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
@@ -81,9 +98,9 @@ def setup_logging(name: str = __name__) -> logging.Logger:
 
     Configures the ROOT logger with the shared handler/formatter/level, so
     that every module's own `logging.getLogger(__name__)` call (connectors.py,
-    aggregator.py, provisioning.py, state.py, ...) automatically inherits the
-    same formatting and level via normal logger propagation, instead of only
-    the single named logger returned here. Without this, per-module loggers
+    provisioning.py, state.py, ...) automatically inherits the same
+    formatting and level via normal logger propagation, instead of only the
+    single named logger returned here. Without this, per-module loggers
     default to the logging library's built-in WARNING level with no handler,
     and INFO-level messages (e.g. "connector -- ACTIVE" confirmations) would
     silently never print.
