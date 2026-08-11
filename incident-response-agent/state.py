@@ -111,6 +111,19 @@ class StateManager:
             os.fsync(f.fileno())
         tmp.replace(self.state_file)  # atomic on POSIX
 
+        # fsync the file's own bytes above is not enough on POSIX: the
+        # rename above is a change to the DIRECTORY's metadata (which name
+        # now points at which inode), and that directory entry change needs
+        # its own fsync to be durable. Without this, a crash immediately
+        # after tmp.replace() could leave the directory pointing at the old
+        # (or no) file even though the new file's contents were themselves
+        # safely flushed to disk.
+        dir_fd = os.open(str(self.state_file.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
     def get_handled(self, key: str) -> Optional[Dict]:
         """Return the prior run's recorded outcome for this incident_key, or None if unhandled."""
         return self._handled.get(key)
