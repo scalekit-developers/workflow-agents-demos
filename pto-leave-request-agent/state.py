@@ -1,6 +1,5 @@
 """
-State management for idempotency on PTO submissions, and a local leave-usage
-ledger used as a stand-in for Gusto's missing balance API.
+State management for idempotency on PTO submissions.
 
 A PTO request is fundamentally different from the recurring/polling
 workloads in the sibling agents (revenue-forecast-commentary-agent,
@@ -15,29 +14,29 @@ comparison.
 
 Fingerprint = sha256(employee_email + pto_type + start_date + end_date),
 normalized (lowercased email, ISO dates). Two requests with the same key are
-treated as the same request: if the first one already completed the Google
-Calendar block and Slack notification, the second run skips re-doing that
-work rather than creating a duplicate calendar event or double-DMing the
-manager. This also makes "submit once" and "process a small pending queue"
-the same underlying operation: each entry in the request ledger is one
-request, keyed by its own fingerprint, so POLLING_MODE (see run_flow.py) can
-safely re-check the same request on an interval without side effects once
-it's marked complete.
+treated as the same request: if the first one already completed the Deel
+submission, Google Calendar block, and Slack notification, the second run
+skips re-doing that work rather than creating a duplicate Deel request or
+double-DMing the manager. This also makes "submit once" and "process a small
+pending queue" the same underlying operation: each entry in the request
+ledger is one request, keyed by its own fingerprint, so POLLING_MODE (see
+run_flow.py) can safely re-check the same request on an interval without
+side effects once it's marked complete.
 
-Two separate on-disk files are used so the two concerns never collide:
-  - state/processed_requests.json: one entry per request fingerprint
-    (idempotency ledger, see StateManager below).
-  - state/pto_usage.json: one running total of days used per employee this
-    year (the balance ledger, see UsageLedger below), which exists only
-    because GUSTOMCP has no time-off-balance tool to read from instead (see
-    aggregator.py and README).
+There is no separate local balance ledger: Deel's
+deelmcp_timeoff_entitlement_list is a real, authoritative balance source,
+read fresh at request time (see aggregator.py), so there is nothing for a
+local running total to track.
 """
 
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Dict, Optional
+
+_PID = os.getpid()
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +45,9 @@ def compute_request_fingerprint(employee_email: str, pto_type: str, start_date: 
     """
     Build a stable idempotency key for one leave request.
 
-    Unlike the revenue-forecast agent's aggregate content fingerprint (which
-    intentionally changes as underlying data drifts, to detect real
-    movement), this fingerprint is keyed on the request's identity, not its
-    content, since the "content" of a PTO request (who, what type, which
-    dates) IS its identity -- there is nothing else to compare against.
+    This fingerprint is keyed on the request's identity, not its content,
+    since the "content" of a PTO request (who, what type, which dates) IS
+    its identity -- there is nothing else to compare against.
     """
     payload = {
         "employee_email": employee_email.strip().lower(),
@@ -65,8 +62,8 @@ def compute_request_fingerprint(employee_email: str, pto_type: str, start_date: 
 class StateManager:
     """
     Tracks the outcome of each distinct PTO request (by fingerprint) so a
-    re-run of the same request doesn't re-block the calendar or re-send the
-    Slack DM for work that already completed.
+    re-run of the same request doesn't re-submit to Deel, re-block the
+    calendar, or re-send the Slack DM for work that already completed.
     """
 
     def __init__(self, state_file: Optional[Path] = None):
@@ -82,7 +79,7 @@ class StateManager:
                 raw = json.loads(self.state_file.read_text())
                 self._requests = raw if isinstance(raw, dict) else {}
                 logger.debug(f"Loaded state for {len(self._requests)} PTO request(s)")
-            except (json.JSONDecodeError, TypeError, UnicodeDecodeError, FileNotFoundError):
+            except (json.JSONDecodeError, TypeError, UnicodeDecodeError, OSError):
                 logger.warning("State file corrupted or unreadable, starting fresh")
                 self._requests = {}
         else:
@@ -90,10 +87,44 @@ class StateManager:
             self._requests = {}
 
     def save(self) -> None:
+        """
+        Write the ledger atomically: re-read the current on-disk state and
+        merge it with this process's in-memory entries first (so a second
+        concurrent run touching a different request fingerprint doesn't
+        silently lose its write if this process saves last), then write to a
+        temp file unique to this process, flush and fsync it so the data is
+        actually durable on disk before the atomic rename, then fsync the
+        containing directory too -- a rename's directory-entry update is a
+        separate durability guarantee from the file's own contents being
+        flushed, and without it a crash immediately after the rename could
+        still lose the just-written "completed" marker despite the request
+        having already reached Deel, risking a duplicate submission on the
+        next run.
+        """
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._requests, indent=2, sort_keys=True))
+
+        on_disk: Dict[str, Dict] = {}
+        if self.state_file.exists():
+            try:
+                raw = json.loads(self.state_file.read_text())
+                on_disk = raw if isinstance(raw, dict) else {}
+            except (json.JSONDecodeError, TypeError, UnicodeDecodeError, OSError):
+                pass  # corrupted/unreadable on-disk state loses to this process's in-memory view, same as load()'s own fallback
+        merged = {**on_disk, **self._requests}
+        self._requests = merged
+
+        tmp = self.state_file.with_suffix(f".tmp.{_PID}")
+        with open(tmp, "w") as f:
+            f.write(json.dumps(merged, indent=2, sort_keys=True))
+            f.flush()
+            os.fsync(f.fileno())
         tmp.replace(self.state_file)  # atomic on POSIX
+
+        dir_fd = os.open(str(self.state_file.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
     def get(self, fingerprint: str) -> Optional[Dict]:
         return self._requests.get(fingerprint)
@@ -107,7 +138,7 @@ class StateManager:
         """
         Record progress for a request as steps complete, so a crash mid-flow
         leaves an accurate partial record rather than silently losing which
-        steps actually ran (e.g. calendar block succeeded but Slack failed).
+        steps actually ran (e.g. Deel submission succeeded but Slack failed).
         """
         entry = self._requests.setdefault(fingerprint, {})
         entry.update(fields)
@@ -115,54 +146,3 @@ class StateManager:
 
     def mark_completed(self, fingerprint: str, **fields) -> None:
         self.mark_step(fingerprint, status="completed", **fields)
-
-
-class UsageLedger:
-    """
-    A local running total of leave days used per employee, standing in for
-    Gusto's missing time-off-balance API (see module docstring). Each
-    completed, non-rejected request adds its business-day count here; the
-    total is what aggregator.py's validate_leave_request() checks against
-    PTO_ANNUAL_ENTITLEMENT_DAYS.
-
-    This is a real limitation, not an implementation detail to gloss over:
-    if the same employee's PTO is also tracked natively inside Gusto by some
-    other system or process, this ledger will drift out of sync with it,
-    since GUSTOMCP exposes no tool this agent can use to read or write an
-    authoritative balance. See README's Error Handling & Edge Cases section.
-    """
-
-    def __init__(self, usage_file: Optional[Path] = None):
-        if usage_file is None:
-            usage_file = Path(__file__).parent / "state" / "pto_usage.json"
-        self.usage_file = usage_file
-        self._usage: Dict[str, float] = {}
-        self.load()
-
-    def load(self) -> None:
-        if self.usage_file.exists():
-            try:
-                raw = json.loads(self.usage_file.read_text())
-                self._usage = raw if isinstance(raw, dict) else {}
-            except (json.JSONDecodeError, TypeError, UnicodeDecodeError, FileNotFoundError):
-                logger.warning("PTO usage ledger corrupted or unreadable, starting fresh")
-                self._usage = {}
-        else:
-            self._usage = {}
-
-    def save(self) -> None:
-        self.usage_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.usage_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._usage, indent=2, sort_keys=True))
-        tmp.replace(self.usage_file)
-
-    def days_used(self, employee_email: str) -> float:
-        return float(self._usage.get(employee_email.strip().lower(), 0.0))
-
-    def add_days(self, employee_email: str, days: float) -> float:
-        """Record additional days used and persist immediately. Returns the new total."""
-        key = employee_email.strip().lower()
-        new_total = self.days_used(employee_email) + days
-        self._usage[key] = new_total
-        self.save()
-        return new_total

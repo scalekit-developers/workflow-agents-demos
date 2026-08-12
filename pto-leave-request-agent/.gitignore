@@ -3,5 +3,4 @@ __pycache__/
 *.pyc
 .venv/
 state/processed_requests.json
-state/pto_usage.json
 .DS_Store

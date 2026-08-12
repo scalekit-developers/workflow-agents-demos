@@ -1,27 +1,30 @@
 """
-Business logic: validate the requested leave against the configured
-balance/policy, build the Google Calendar event details, and draft the
-Slack notification text for the manager.
+Business logic: validate the requested leave against Deel's real balance
+data, build the Google Calendar event details, and draft the Slack
+notification text for the manager.
 
 Leave balance / policy source of truth
 ---------------------------------------
-GUSTOMCP's real tool surface (verified live, see connectors.py module
-docstring) has no time-off balance or time-off policy tool at all -- Gusto
-cannot answer "how many vacation days does this employee have left" through
-any tool this agent can call. This agent therefore validates the requested
-leave against a CONFIGURED annual entitlement (PTO_ANNUAL_ENTITLEMENT_DAYS)
-and a running total of days already used, tracked in local state
-(state/pto_usage.json, separate from state/processed_requests.json's
-idempotency ledger). This is a documented workaround for a real, verified
-connector gap, not a silent guess -- see README's Error Handling section.
+deelmcp_timeoff_entitlement_list returns a real remaining balance for a
+given hris_profile_id and policy type. This agent reads that balance at
+request time rather than tracking a local running total, so the check is
+always current against whatever Deel itself considers the source of truth
+(including time off approved through channels other than this agent).
+
+The real response carries the remaining balance under an "available" field
+(a numeric string, e.g. "0.00"), confirmed live. parse_entitlement_remaining()
+below also tries a few other plausible field names as a defensive fallback,
+and raises a clear, specific error rather than silently treating a missing
+or unrecognized field as "zero remaining" or "unlimited" -- a real API shape
+change should surface immediately, not silently misvalidate every future
+request.
 
 Business days calculation
 --------------------------
 Requested leave days are counted as weekdays (Monday-Friday) between
-start_date and end_date inclusive. Public holidays are not excluded (Gusto's
-connected tools expose no holiday-calendar object either), so a request
-spanning a company holiday will count that day as a leave day. This is
-called out explicitly in the calendar block and Slack notification so
+start_date and end_date inclusive. Public holidays are not excluded, so a
+request spanning a company holiday will count that day as a leave day. This
+is called out explicitly in the calendar block and Slack notification so
 nobody is misled into thinking holiday-awareness happened silently.
 """
 
@@ -33,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 PTO_TYPE_LABELS = {
     "vacation": "Vacation",
+    "paid": "Paid Leave",
     "sick": "Sick Leave",
     "personal": "Personal Leave",
     "bereavement": "Bereavement Leave",
@@ -59,23 +63,44 @@ class LeaveValidationError(Exception):
         self.code = code
 
 
+def parse_entitlement_remaining(entitlement: Dict) -> float:
+    """
+    Extract the remaining-days figure from a Deel entitlement record. Tries
+    the plausible field names in order and raises LeaveValidationError
+    (never silently defaults to 0 or unlimited) if none are present, since
+    guessing a balance here is worse than failing with a clear message about
+    what Deel actually returned.
+    """
+    for field in ("remaining", "available", "balance", "remaining_balance", "days_remaining"):
+        if field in entitlement and entitlement[field] is not None:
+            try:
+                return float(entitlement[field])
+            except (TypeError, ValueError):
+                continue
+    raise LeaveValidationError(
+        f"Deel's entitlement record for this policy has no recognizable "
+        f"remaining-balance field (got keys: {list(entitlement.keys())}). "
+        f"Cannot validate this request against a real balance.",
+        code="UNREADABLE_ENTITLEMENT",
+    )
+
+
 def validate_leave_request(
     start_date: datetime.date,
     end_date: datetime.date,
     requested_days: int,
-    annual_entitlement_days: float,
-    days_already_used: float,
-) -> Tuple[float, float]:
+    remaining_balance: float,
+) -> float:
     """
-    Validate a leave request against the configured entitlement.
+    Validate a leave request against Deel's real remaining balance.
 
-    Returns (remaining_before, remaining_after) in days if valid. Raises
-    LeaveValidationError (never silently submits) if:
+    Returns remaining_after (days) if valid. Raises LeaveValidationError
+    (never silently submits) if:
       - the request is entirely in the past
       - the request would exceed the remaining balance
 
-    This runs BEFORE any write to Gusto, Google Calendar, or Slack -- an
-    insufficient-balance request never reaches a connector call at all.
+    This runs BEFORE any write to Deel, Google Calendar, or Slack -- an
+    insufficient-balance request never reaches a create-request call at all.
     """
     today = datetime.date.today()
     if end_date < today:
@@ -85,19 +110,16 @@ def validate_leave_request(
             code="PAST_DATES",
         )
 
-    remaining_before = annual_entitlement_days - days_already_used
-    remaining_after = remaining_before - requested_days
+    remaining_after = remaining_balance - requested_days
 
     if remaining_after < 0:
         raise LeaveValidationError(
             f"Insufficient leave balance: requested {requested_days} day(s), "
-            f"but only {remaining_before:g} day(s) remain "
-            f"({annual_entitlement_days:g} annual entitlement minus "
-            f"{days_already_used:g} already used/pending)",
+            f"but only {remaining_balance:g} day(s) remain per Deel",
             code="INSUFFICIENT_BALANCE",
         )
 
-    return remaining_before, remaining_after
+    return remaining_after
 
 
 def build_calendar_summary(employee_name: str, pto_type: str) -> str:
@@ -128,10 +150,15 @@ def build_manager_slack_message(
         "",
         f"Dates: {start_date.isoformat()} to {end_date.isoformat()} "
         f"({requested_days} business day{'s' if requested_days != 1 else ''})",
-        f"Remaining balance after this request: {remaining_after:g} day(s)",
+        f"Remaining balance after this request: {remaining_after:g} day(s) (per Deel)",
     ]
     if reason:
         lines.append(f"Reason: {reason}")
+    lines.append("")
+    lines.append(
+        "This request has been submitted to Deel and is pending your approval "
+        "there."
+    )
     lines.append("")
 
     if calendar_event_created:
@@ -153,11 +180,11 @@ def build_manager_slack_message(
     return "\n".join(lines)
 
 
-def build_gusto_rejection_message(employee_name: str, reason: str) -> str:
-    """Slack message sent to the manager when Gusto (or policy validation) rejects the request."""
+def build_rejection_message(employee_name: str, reason: str) -> str:
+    """Slack message sent to the manager when the request is rejected before reaching Deel."""
     name = employee_name or "the employee"
     return (
         f"*Leave request NOT submitted for {name}*\n\n"
         f"Reason: {reason}\n\n"
-        "_No calendar block or Gusto submission was made for this request._"
+        "_No calendar block or Deel submission was made for this request._"
     )

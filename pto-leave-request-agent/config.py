@@ -6,21 +6,34 @@ Validates on startup and provides clear error messages.
 """
 
 import datetime
+import logging
 import os
 import sys
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
-logger = None  # Set by run_flow after logging is initialized
+logger = logging.getLogger(__name__)
 
-# Gusto's real policy-type taxonomy, verified against the workspace's Gusto
-# company profile (gustomcp_get_company -> compensations.hourly), which lists
-# time-off-adjacent earning types such as "Outstanding vacation", "Holiday",
-# "Emergency sick - self care", "Emergency sick - caring for others", and
-# "FMLA Public Health Emergency Leave". There is no dedicated time-off policy
-# object exposed by GUSTOMCP's tool surface (see connectors.py and README),
-# so this agent normalizes PTO_TYPE to one of a small, human-readable set
-# rather than trying to match Gusto's earning-type UUIDs exactly.
-VALID_PTO_TYPES = ("vacation", "sick", "personal", "bereavement", "other")
+# This agent's own PTO_TYPE taxonomy, mapped to Deel's real policy_type_name
+# enum (verified live against deelmcp_timeoff_policy_list's input_schema).
+# Kept as a small, human-readable set rather than exposing Deel's full
+# 29-value enum (which includes country-specific types like "Hajj leave",
+# "RTT", "Regional holiday") directly as CLI/env input. "paid" is included
+# because Deel's own default general-purpose policy type in a freshly set up
+# organization is named "Paid leave" (verified live against a real assigned
+# policy), distinct from "Vacation" -- which Vacation/other name applies
+# depends entirely on how your organization's Deel policies are configured,
+# so confirm with `deelmcp_timeoff_policy_list` for a specific employee
+# rather than assuming.
+VALID_PTO_TYPES = ("vacation", "paid", "sick", "personal", "bereavement", "other")
+
+PTO_TYPE_TO_DEEL_POLICY_TYPE = {
+    "vacation": "Vacation",
+    "paid": "Paid leave",
+    "sick": "Sick leave",
+    "personal": "Personal leave",
+    "bereavement": "Bereavement leave",
+    "other": "Other leave",
+}
 
 
 class Config:
@@ -34,32 +47,29 @@ class Config:
         self.scalekit_client_secret = os.environ.get("SCALEKIT_CLIENT_SECRET")
 
         # Connector identities (the "identifier" each connected account is keyed by)
-        self.gusto_user = os.environ.get("GUSTO_USER")
+        self.deel_user = os.environ.get("DEEL_USER")
         self.google_calendar_user = os.environ.get("GOOGLE_CALENDAR_USER")
         self.slack_user = os.environ.get("SLACK_USER")
 
         # Connector names -- must match the exact connection name shown in the
         # Scalekit dashboard, which is often auto-suffixed per workspace
-        # (e.g. "gustomcp-SoSOMZ20"), not just the generic provider label.
-        # Verified live against this workspace's connections via
-        # list_connected_accounts before writing connectors.py.
-        self.gusto_connector = os.environ.get("GUSTO_CONNECTOR", "gustomcp-SoSOMZ20")
+        # (e.g. "deelmcp-zTWsHKTh"), not just the generic provider label.
+        self.deel_connector = os.environ.get("DEEL_CONNECTOR", "deelmcp-zTWsHKTh")
         self.google_calendar_connector = os.environ.get("GOOGLE_CALENDAR_CONNECTOR", "googlecalendar")
         self.slack_connector = os.environ.get("SLACK_CONNECTOR", "slackmcp")
 
         # The employee whose PTO this run is for (the delegated identity this
-        # agent acts on behalf of). Gusto's connected tool surface has no
-        # time-off-specific tools (see connectors.py module docstring), so
-        # this is used to look the person up as a Gusto employee OR
-        # contractor record (gustomcp_list_employees / gustomcp_list_contractors)
-        # purely for identity verification in provisioning.py, not for
-        # balance/policy data.
+        # agent acts on behalf of). Deel's time-off tools are scoped by
+        # hris_profile_id (a UUID), not email -- see connectors.py's
+        # DeelConnector.find_person_by_email for how this is resolved.
         self.employee_email = os.environ.get("EMPLOYEE_EMAIL")
         self.employee_name = os.environ.get("EMPLOYEE_NAME", "")
 
-        # Optional: if you already know the employee's Gusto UUID, set it to
-        # skip the list-and-match lookup in provisioning.py.
-        self.employee_gusto_uuid = os.environ.get("EMPLOYEE_GUSTO_UUID", "")
+        # Optional: if you already know the employee's Deel hris_profile_id,
+        # set it to skip the list-every-contract-and-match-by-email lookup
+        # in provisioning.py -- faster, and avoids ambiguity when two people
+        # share a display name.
+        self.employee_deel_profile_id = os.environ.get("EMPLOYEE_DEEL_PROFILE_ID", "")
 
         # Manager notified via Slack DM. Resolved to a Slack user ID via
         # slackmcp_slack_search_users if MANAGER_SLACK_ID isn't set directly.
@@ -71,18 +81,6 @@ class Config:
         self.pto_end_date = os.environ.get("PTO_END_DATE", "")
         self.pto_type = os.environ.get("PTO_TYPE", "vacation").strip().lower()
         self.pto_reason = os.environ.get("PTO_REASON", "")
-
-        # Annual leave entitlement and already-used days, in whole days, used
-        # as the balance/policy source of truth. Gusto's MCP connector in
-        # this workspace exposes no time-off-balance or time-off-policy tool
-        # (verified live across its full 38-tool catalog, see connectors.py),
-        # so this agent cannot read a real balance from Gusto and instead
-        # validates against a configured entitlement. This is a documented
-        # workaround, not a silent guess -- see README's Error Handling
-        # section for the full explanation.
-        self.pto_annual_entitlement_days = self._parse_float(
-            "PTO_ANNUAL_ENTITLEMENT_DAYS", 20.0, min_value=0.0
-        )
 
         # Google Calendar destination for the PTO block.
         self.google_calendar_id = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
@@ -108,8 +106,8 @@ class Config:
         if not self.scalekit_client_secret:
             errors.append("SCALEKIT_CLIENT_SECRET")
 
-        if not self.gusto_user:
-            errors.append("GUSTO_USER")
+        if not self.deel_user:
+            errors.append("DEEL_USER")
         if not self.google_calendar_user:
             errors.append("GOOGLE_CALENDAR_USER")
         if not self.slack_user:
@@ -127,10 +125,7 @@ class Config:
 
         if errors:
             msg = f"Missing required config: {', '.join(errors)}"
-            if logger:
-                logger.error(msg)
-            else:
-                print(f"ERROR: {msg}")
+            logger.error(msg)
             sys.exit(1)
 
         if self.pto_type not in VALID_PTO_TYPES:
@@ -138,13 +133,14 @@ class Config:
                 f"Invalid PTO_TYPE: {self.pto_type!r}. Must be one of: "
                 f"{', '.join(VALID_PTO_TYPES)}"
             )
-            if logger:
-                logger.error(msg)
-            else:
-                print(f"ERROR: {msg}")
+            logger.error(msg)
             sys.exit(1)
 
         self._validate_dates()
+
+    def deel_policy_type_name(self) -> str:
+        """The Deel policy_type_name this run's PTO_TYPE maps to."""
+        return PTO_TYPE_TO_DEEL_POLICY_TYPE[self.pto_type]
 
     def _validate_dates(self):
         """Parse and sanity-check PTO_START_DATE / PTO_END_DATE. Fails fast on bad input."""
@@ -182,62 +178,35 @@ class Config:
             return
 
     def _fatal(self, msg: str):
-        if logger:
-            logger.error(msg)
-        else:
-            print(f"ERROR: {msg}")
+        logger.error(msg)
         sys.exit(1)
 
-    def get_connector_users(self) -> Dict[str, str]:
-        """Mapping of connector name -> identifier, for auth checks."""
-        return {
-            self.gusto_connector: self.gusto_user,
-            self.google_calendar_connector: self.google_calendar_user,
-            self.slack_connector: self.slack_user,
-        }
+    def get_connector_users(self) -> List[tuple]:
+        """
+        List of (connector name, identifier) pairs, for auth checks. A list
+        rather than a dict so two connectors that happen to share a
+        connection name both still get checked, instead of one silently
+        overwriting the other as a dict key would.
+        """
+        return [
+            (self.deel_connector, self.deel_user),
+            (self.google_calendar_connector, self.google_calendar_user),
+            (self.slack_connector, self.slack_user),
+        ]
 
     @staticmethod
-    def _parse_int(key: str, default: int, min_value: int = None) -> int:
+    def _parse_int(key: str, default: int, min_value: Optional[int] = None) -> int:
         raw = os.environ.get(key, str(default))
         try:
             value = int(raw)
         except ValueError:
             msg = f"Invalid {key}: {raw!r} (must be an integer)"
-            if logger:
-                logger.error(msg)
-            else:
-                print(f"ERROR: {msg}")
+            logger.error(msg)
             sys.exit(1)
 
         if min_value is not None and value < min_value:
             msg = f"{key} must be >= {min_value}, got {value}"
-            if logger:
-                logger.error(msg)
-            else:
-                print(f"ERROR: {msg}")
-            sys.exit(1)
-
-        return value
-
-    @staticmethod
-    def _parse_float(key: str, default: float, min_value: float = None) -> float:
-        raw = os.environ.get(key, str(default))
-        try:
-            value = float(raw)
-        except ValueError:
-            msg = f"Invalid {key}: {raw!r} (must be a number)"
-            if logger:
-                logger.error(msg)
-            else:
-                print(f"ERROR: {msg}")
-            sys.exit(1)
-
-        if min_value is not None and value < min_value:
-            msg = f"{key} must be >= {min_value}, got {value}"
-            if logger:
-                logger.error(msg)
-            else:
-                print(f"ERROR: {msg}")
+            logger.error(msg)
             sys.exit(1)
 
         return value
