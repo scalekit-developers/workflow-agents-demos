@@ -2,5 +2,5 @@
 __pycache__/
 *.pyc
 .venv/
-state/provisioned_employees.json
+state/provisioned_hires.json
 .DS_Store

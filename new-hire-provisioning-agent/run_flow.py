@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
 """
-New Hire Provisioning Agent: Gusto -> Google Workspace + Notion + Slack
+New Hire Provisioning Agent: Deel -> Google Workspace + Notion + Slack
 
-Runs on behalf of an HR admin: scans Gusto for new hire records that haven't
-been provisioned yet (or targets one specific hire via NEW_HIRE_EMPLOYEE_ID /
-NEW_HIRE_NAME), provisions a Google Workspace account for them via Domain-Wide
-Delegation, creates a Notion onboarding doc from a template/hub page, and
-posts a welcome message to a shared Slack channel.
+Runs on behalf of an HR admin: creates a real direct-employee record for one
+new hire in Deel (person + employment contract, under the organization's own
+legal entity), provisions a Google Workspace account for them via
+Domain-Wide Delegation, creates a Notion onboarding doc from a template/hub
+page, and posts a welcome message to a shared Slack channel.
+
+Deel has no "list of pending hires waiting to be onboarded" concept and no
+delete/terminate tool for a direct employee anywhere in its real catalog
+(both confirmed live -- see connectors.py). This means, unlike a scan-based
+agent, there is nothing to detect; the new hire's details are supplied
+directly (NEW_HIRE_* env vars), and a mistaken real creation cannot be
+undone through this agent or any other Scalekit tool. NEW_HIRE_DRY_RUN=true
+resolves every real ID (legal entity, team, seniority) and logs exactly what
+WOULD be created without ever calling the real creation tool -- strongly
+recommended for first-time setup verification.
 
 Google Workspace provisioning is optional/conditional: if the GOOGLEDWD
 connector isn't configured (a common state until an HR admin completes the
 GCP service account + Domain-Wide Delegation setup, see README), this step
 logs a clear actionable warning and the pipeline continues to Notion and
 Slack rather than aborting. The final summary always states each step's real
-outcome (PROVISIONED / SKIPPED / FAILED) rather than a single pass/fail flag,
-so "Workspace not set up yet" is never confused with "the whole run failed".
+outcome (OK / SKIPPED / FAILED) rather than a single pass/fail flag.
 
-Each employee ID is provisioned at most once: state.py tracks which of the
-three steps (workspace, notion, slack) have already succeeded per employee,
-so re-running (or polling) never re-creates a duplicate Notion page or
-re-posts a duplicate Slack welcome for someone already handled. A new hire
-whose Workspace step failed/was skipped is correctly re-surfaced on the next
-run to retry just that step.
+Re-running with the same new-hire details (first name, last name, personal
+email, start date) is a safe no-op: state.py tracks which of the four steps
+(deel, workspace, notion, slack) have already succeeded, so a retry never
+creates a duplicate Deel record, Notion page, or Slack post.
 
 Scalekit Agent Auth handles OAuth for all connectors -- token storage,
 refresh, and every API call go through actions.execute_tool(). No manual
@@ -30,50 +37,61 @@ token management, no direct API imports.
 Setup:
   cp .env.example .env        # fill in your credentials
   pip install -r requirements.txt
-  python run_flow.py           # scan Gusto once and provision any new hires
+  python run_flow.py           # provision the configured new hire and exit
 
 Exit codes:
-  0   = success (no error; includes "no new hires found", a normal outcome)
-  1   = error (config missing, provisioning failed, or 5 consecutive polling errors)
-  2   = new hire(s) found but nothing could be provisioned at all this run
-        (e.g. Notion parent page unreachable for every candidate)
+  0   = success (hire fully provisioned, or already completed on a prior
+        run and correctly skipped)
+  1   = error (config missing, provisioning failed, Deel unreachable, or 5
+        consecutive polling errors)
+  2   = the Deel creation itself failed -- not a system error in the sense
+        of a bug, but the one outcome serious enough not to fold into a
+        generic "0 with warnings" the way Workspace/Notion/Slack failures do
   130 = interrupted (Ctrl+C or SIGTERM)
 """
 
 import signal
 import sys
 import time
-from typing import Dict, List, Optional
+from typing import Optional
 
 import scalekit.client
 from dotenv import load_dotenv
 
 from aggregator import (
+    build_full_name,
     build_onboarding_page_markdown,
     build_onboarding_page_title,
     build_welcome_message,
-    extract_onboarding_fields,
 )
-import config as config_module
 from config import Config
 from connectors import (
     Connector,
     ConnectorError,
     ConnectorUnavailableError,
+    DeelConnector,
     GoogleWorkspaceConnector,
-    GustoConnector,
     NotionConnector,
     SlackConnector,
 )
 import logging_config
-from provisioning import ProvisioningError, verify_gusto_queryable, verify_notion_parent_page
-from state import STEP_NOTION, STEP_SLACK, STEP_WORKSPACE, StateManager
+from provisioning import (
+    ProvisioningError,
+    resolve_deel_legal_entity,
+    resolve_deel_team,
+    verify_deel_writable,
+    verify_notion_parent_page,
+)
+from state import STEP_DEEL, STEP_NOTION, STEP_SLACK, STEP_WORKSPACE, StateManager, compute_hire_fingerprint
 
 load_dotenv()
 logger = logging_config.setup_logging(__name__)
-config_module.logger = logger
 
 _shutdown_requested = False
+
+
+class ShutdownRequested(Exception):
+    """Raised to unwind cleanly to exit code 130 when a shutdown signal arrives before the irreversible Deel creation has been made."""
 
 
 def _signal_handler(sig, frame):
@@ -89,6 +107,7 @@ signal.signal(signal.SIGTERM, _signal_handler)
 def init_config() -> Config:
     cfg = Config()
     cfg.validate()
+    logging_config.register_secret(cfg.scalekit_client_secret)
     return cfg
 
 
@@ -106,235 +125,200 @@ def init_scalekit(cfg: Config):
         sys.exit(1)
 
 
-def _employee_id_of(employee: Dict) -> str:
-    return str(employee.get("uuid") or employee.get("id") or "")
-
-
-def find_target_hires(cfg: Config, gusto: GustoConnector, state: StateManager) -> List[Dict]:
+def run_cycle(cfg: Config, actions, state: StateManager) -> int:
     """
-    Step 1: resolve the list of new hire records to process this run.
+    Provision the configured new hire once.
 
-    If NEW_HIRE_EMPLOYEE_ID or NEW_HIRE_NAME is set, targets exactly that one
-    hire (a one-shot override for testing or a manual re-run). Otherwise scans
-    Gusto for records that look like new hires (see GustoConnector.
-    find_new_hires) and filters out anyone state.py already marked as fully
-    provisioned, so a normal run only ever returns hires with real work left
-    to do.
+    Returns:
+      0  the hire was fully processed (created now, or already completed on
+         a prior run and correctly skipped)
+      2  the Deel creation itself failed or was rejected -- the one outcome
+         serious enough not to fold into "0 with warnings" the way
+         Workspace/Notion/Slack failures do
+      1  a required step (config/provisioning) fails before reaching Deel
+
+    Never raises ConnectorError out of this function; every failure mode is
+    caught, logged clearly, and turned into a return code.
     """
-    if cfg.new_hire_employee_id:
-        logger.info(f"Targeting specific employee by ID: {cfg.new_hire_employee_id}")
-        try:
-            detail = gusto.get_employee(cfg.new_hire_employee_id)
-        except ConnectorError as e:
-            logger.error(f"Could not fetch employee '{cfg.new_hire_employee_id}': {e}")
-            return []
-        if not detail:
-            logger.error(f"No employee found for NEW_HIRE_EMPLOYEE_ID '{cfg.new_hire_employee_id}'")
-            return []
-        return [detail]
-
-    if cfg.new_hire_name:
-        logger.info(f"Targeting specific employee by name: {cfg.new_hire_name}")
-        try:
-            matches = gusto.list_employees(page=1, per=25)
-        except ConnectorError as e:
-            logger.error(f"Could not search Gusto employees by name: {e}")
-            return []
-        name_lower = cfg.new_hire_name.strip().lower()
-        found = [
-            e for e in matches
-            if name_lower in f"{e.get('first_name', '')} {e.get('last_name', '')}".strip().lower()
-        ]
-        if not found:
-            logger.error(f"No employee found matching NEW_HIRE_NAME '{cfg.new_hire_name}'")
-            return []
-        return found
-
-    logger.info(
-        f"Scanning Gusto for new hires "
-        f"(window: {cfg.new_hire_lookback_days}d back, {cfg.new_hire_lookahead_days}d ahead)"
-    )
-    try:
-        candidates = gusto.find_new_hires(cfg.new_hire_lookback_days, cfg.new_hire_lookahead_days)
-    except ConnectorError as e:
-        logger.error(f"Could not scan Gusto for new hires: {e}")
-        return []
-
-    unprovisioned = [
-        e for e in candidates
-        if not state.is_fully_provisioned(_employee_id_of(e))
-    ]
-    skipped = len(candidates) - len(unprovisioned)
-    if skipped:
-        logger.info(f"{skipped} candidate(s) already fully provisioned, skipping")
-
-    return unprovisioned
-
-
-def provision_one_hire(
-    cfg: Config,
-    employee_summary: Dict,
-    gusto: GustoConnector,
-    workspace: GoogleWorkspaceConnector,
-    notion: NotionConnector,
-    slack: SlackConnector,
-    state: StateManager,
-) -> Dict[str, str]:
-    """
-    Run Steps 2-4 for one new hire and return a per-step outcome dict, e.g.
-    {"workspace": "SKIPPED", "notion": "OK", "slack": "OK"}. Never raises --
-    every step is independently try/excepted so one step's failure never
-    blocks the others, matching the required "Workspace: FAILED, Notion: OK,
-    Slack: OK" style final summary.
-    """
-    employee_id = _employee_id_of(employee_summary)
-    outcomes = {"workspace": "SKIPPED", "notion": "SKIPPED", "slack": "SKIPPED"}
-
-    # Fetch full detail record if we only have a list-summary so far (has an
-    # ID but is missing e.g. job/start_date fields only get_employee returns).
-    employee = employee_summary
-    if employee_id and "jobs" not in employee_summary:
-        try:
-            detail = gusto.get_employee(employee_id)
-            if detail:
-                employee = detail
-        except ConnectorError as e:
-            logger.warning(f"Could not fetch full Gusto profile for {employee_id}, using summary record: {e}")
-
-    fields, warnings = extract_onboarding_fields(employee)
-    if warnings:
-        logger.warning(
-            f"Employee record for '{fields['full_name']}' is missing: {', '.join(warnings)} "
-            f"-- proceeding with placeholders where needed"
-        )
-
-    logger.info(f"Provisioning new hire: {fields['full_name']} (Gusto ID: {employee_id or 'unknown'})")
-
-    # --- Step 2: Google Workspace (optional, must degrade gracefully) ---
-    workspace_status_text = "Not provisioned: Google Workspace step not attempted"
-    if state.is_step_done(employee_id, STEP_WORKSPACE):
-        outcomes["workspace"] = "OK"
-        workspace_status_text = "Already provisioned (see prior run)"
-        logger.info("Step 2: Google Workspace account already provisioned for this hire, skipping")
-    elif not cfg.google_workspace_domain:
-        outcomes["workspace"] = "SKIPPED"
-        workspace_status_text = "Not provisioned: GOOGLE_WORKSPACE_DOMAIN not configured"
-        logger.warning("Step 2: GOOGLE_WORKSPACE_DOMAIN not set, skipping Google Workspace provisioning")
-    else:
-        logger.info("Step 2: Provisioning Google Workspace account via Domain-Wide Delegation")
-        try:
-            local_part = f"{fields['full_name']}".strip().lower().replace(" ", ".") or "new.hire"
-            primary_email = f"{local_part}@{cfg.google_workspace_domain}"
-            workspace.provision_user(
-                primary_email=primary_email,
-                first_name=employee.get("first_name", ""),
-                last_name=employee.get("last_name", ""),
-            )
-            outcomes["workspace"] = "OK"
-            workspace_status_text = f"Provisioned: {primary_email}"
-            state.mark_step_done(employee_id, STEP_WORKSPACE, {"email": primary_email})
-            logger.info(f"[OK] Google Workspace account provisioned: {primary_email}")
-        except NotImplementedError as e:
-            outcomes["workspace"] = "SKIPPED"
-            workspace_status_text = "Not provisioned: Google Workspace (DWD) is not set up for this workspace yet"
-            logger.warning(
-                "Step 2: Google Workspace provisioning is not available -- "
-                "GOOGLEDWD is not configured in this Scalekit workspace. "
-                "See README Prerequisites for the required GCP service account "
-                "+ Domain-Wide Delegation setup. Continuing to Notion and Slack."
-            )
-            logger.debug(f"Detail: {e}")
-        except ConnectorUnavailableError as e:
-            outcomes["workspace"] = "SKIPPED"
-            workspace_status_text = "Not provisioned: Google Workspace connector not configured"
-            logger.warning(
-                f"Step 2: Google Workspace connector is not configured: {e}. "
-                f"Continuing to Notion and Slack."
-            )
-        except ConnectorError as e:
-            outcomes["workspace"] = "FAILED"
-            workspace_status_text = f"FAILED: {e}"
-            logger.error(f"Step 2: Google Workspace provisioning failed: {e}. Continuing to Notion and Slack.")
-
-    # --- Step 3: Notion onboarding doc ---
-    if state.is_step_done(employee_id, STEP_NOTION):
-        outcomes["notion"] = "OK"
-        logger.info("Step 3: Notion onboarding page already created for this hire, skipping")
-    else:
-        logger.info("Step 3: Creating Notion onboarding page")
-        title = build_onboarding_page_title(fields)
-        markdown_body = build_onboarding_page_markdown(fields, warnings, workspace_status_text)
-        try:
-            result = notion.upsert_onboarding_page(cfg.notion_parent_page_id, title, markdown_body)
-            page_id = ((result.get("pages") or [{}])[0]).get("id", "")
-            outcomes["notion"] = "OK"
-            state.mark_step_done(employee_id, STEP_NOTION, {"page_id": page_id})
-            logger.info(f"[OK] Notion onboarding page ready: {page_id}")
-        except ConnectorError as e:
-            outcomes["notion"] = "FAILED"
-            logger.error(f"Step 3: Failed to create Notion onboarding page: {e}. Continuing to Slack.")
-
-    # --- Step 4: Slack welcome message ---
-    if state.is_step_done(employee_id, STEP_SLACK):
-        outcomes["slack"] = "OK"
-        logger.info("Step 4: Slack welcome message already posted for this hire, skipping")
-    else:
-        logger.info("Step 4: Posting welcome message to Slack")
-        channel_id = slack.resolve_channel_id(cfg.slack_welcome_channel)
-        if not channel_id:
-            outcomes["slack"] = "FAILED"
-            logger.error(
-                f"Step 4: Could not resolve Slack channel '{cfg.slack_welcome_channel}'. "
-                f"Confirm the channel exists and the bot is a member, or set "
-                f"SLACK_WELCOME_CHANNEL to a literal channel ID."
-            )
-        else:
-            message = build_welcome_message(fields, warnings)
-            try:
-                slack.send_welcome_message(channel_id, message)
-                outcomes["slack"] = "OK"
-                state.mark_step_done(employee_id, STEP_SLACK, {"channel_id": channel_id})
-                logger.info(f"[OK] Welcome message posted to Slack ({cfg.slack_welcome_channel} -> {channel_id})")
-            except ConnectorError as e:
-                outcomes["slack"] = "FAILED"
-                logger.error(f"Step 4: Failed to post Slack welcome message: {e}")
-
-    return outcomes
-
-
-def run_cycle(cfg: Config, actions, state: StateManager) -> Optional[List[Dict]]:
-    """
-    Run one full provisioning cycle. Returns a list of per-hire outcome dicts
-    (possibly empty), or None if there was a hard failure resolving the
-    candidate list itself (distinct from an empty list, which means "no new
-    hires found", a normal outcome, not an error).
-    """
-    gusto = GustoConnector(actions, cfg.gusto_user, cfg.gusto_connector)
+    deel = DeelConnector(actions, cfg.deel_user, cfg.deel_connector)
     workspace = GoogleWorkspaceConnector(actions, cfg.google_workspace_user or cfg.hr_admin_email, cfg.google_workspace_connector)
     notion = NotionConnector(actions, cfg.notion_user, cfg.notion_connector)
     slack = SlackConnector(actions, cfg.slack_user, cfg.slack_connector)
 
-    logger.info("Step 1: Detecting new hire record(s) in Gusto not yet provisioned")
-    hires = find_target_hires(cfg, gusto, state)
+    fingerprint = compute_hire_fingerprint(
+        cfg.new_hire_first_name, cfg.new_hire_last_name, cfg.new_hire_personal_email, cfg.new_hire_start_date
+    )
+    full_name = build_full_name(cfg)
 
-    if not hires:
-        logger.info("No new hires found to provision this cycle")
-        return []
+    if state.is_fully_provisioned(fingerprint):
+        logger.info(
+            f"'{full_name}' ({cfg.new_hire_personal_email}, starting {cfg.new_hire_start_date}) "
+            f"was already fully provisioned on a prior run -- skipping to avoid a duplicate Deel "
+            f"record. Delete state/provisioned_hires.json to force a re-run."
+        )
+        return 0
 
-    logger.info(f"Found {len(hires)} new hire(s) to provision")
+    logger.info("Step 1: Resolving Deel legal entity and team")
+    try:
+        legal_entity_id = resolve_deel_legal_entity(deel, cfg.deel_legal_entity_id)
+        team_id = resolve_deel_team(deel, cfg.deel_team_id)
+    except ProvisioningError as e:
+        logger.error(str(e))
+        return 1
 
-    results = []
-    for employee in hires:
-        if _shutdown_requested:
-            logger.info("Shutdown requested mid-cycle, stopping before the next hire")
-            break
-        outcomes = provision_one_hire(cfg, employee, gusto, workspace, notion, slack, state)
-        results.append(outcomes)
+    seniority_name = None
+    if not state.is_step_done(fingerprint, STEP_DEEL):
+        seniority_name = deel.resolve_seniority_name(cfg.new_hire_seniority)
+        if not seniority_name:
+            real_names = ", ".join(lvl.get("name", "?") for lvl in deel.list_seniorities())
+            logger.error(
+                f"NEW_HIRE_SENIORITY '{cfg.new_hire_seniority}' did not match any real Deel "
+                f"seniority level. Real options: {real_names}"
+            )
+            return 1
 
-        summary = ", ".join(f"{k.capitalize()}: {v}" for k, v in outcomes.items())
-        logger.info(f"[SUMMARY] {summary}")
+    if _shutdown_requested:
+        raise ShutdownRequested("Shutdown requested before creating the Deel record -- no hire was created")
 
-    return results
+    # --- Step 2: Deel direct-employee creation (the one irreversible write) ---
+    deel_status = "Not provisioned: Deel step not attempted"
+    deel_contract_id = ""
+    if state.is_step_done(fingerprint, STEP_DEEL):
+        deel_status = "Already created (see prior run)"
+        logger.info("Step 2: Deel record already created for this hire, skipping")
+    elif cfg.new_hire_dry_run:
+        logger.info(
+            f"Step 2: DRY RUN -- would create Deel direct employee: {full_name} "
+            f"<{cfg.new_hire_personal_email}>, {cfg.new_hire_job_title} "
+            f"({seniority_name}), legal_entity={legal_entity_id}, team={team_id}, "
+            f"start={cfg.new_hire_start_date}, salary={cfg.new_hire_salary:g} {cfg.new_hire_currency}. "
+            f"No real write was made -- set NEW_HIRE_DRY_RUN=false to actually create this hire."
+        )
+        deel_status = "DRY RUN -- not actually created"
+        return 0
+    else:
+        logger.info("Step 2: Creating direct employee record in Deel")
+        try:
+            record = deel.create_direct_employee(
+                legal_entity_id=legal_entity_id,
+                team_id=team_id,
+                email=cfg.new_hire_personal_email,
+                work_email=cfg.new_hire_work_email or cfg.new_hire_personal_email,
+                country=cfg.new_hire_country,
+                first_name=cfg.new_hire_first_name,
+                last_name=cfg.new_hire_last_name,
+                nationality=cfg.new_hire_nationality,
+                job_title=cfg.new_hire_job_title,
+                seniority_name=seniority_name,
+                start_date=cfg.new_hire_start_date,
+                salary=cfg.new_hire_salary,
+                currency=cfg.new_hire_currency,
+                state=cfg.new_hire_state or None,
+                department_id=cfg.deel_department_id or None,
+                employment_type=cfg.new_hire_employment_type,
+            )
+        except ConnectorError as e:
+            logger.error(
+                f"Step 2: Failed to create Deel direct employee: {e}\n"
+                f"Deel has no delete/terminate tool for a direct employee, so if this error "
+                f"happened AFTER a real record was actually created, check the Deel dashboard "
+                f"directly before retrying -- do not assume this failure means nothing was created."
+            )
+            return 2
+
+        deel_employee_id = record.get("id", "")
+        deel_contract_id = (record.get("employment") or {}).get("contract_id", "")
+        deel_status = f"Created: employee {deel_employee_id}" + (f" (contract {deel_contract_id})" if deel_contract_id else "")
+        logger.info(f"[OK] Deel direct employee created: id={deel_employee_id}, contract={deel_contract_id}")
+        state.mark_step_done(fingerprint, STEP_DEEL, {"employee_id": deel_employee_id, "contract_id": deel_contract_id})
+
+    if _shutdown_requested:
+        logger.warning(
+            "Shutdown requested after creating the Deel record -- the hire already exists there; "
+            "continuing to record it rather than leaving the Workspace/Notion/Slack steps undone silently."
+        )
+
+    # --- Step 3: Google Workspace (optional, must degrade gracefully) ---
+    workspace_status = "Not provisioned: Google Workspace step not attempted"
+    if state.is_step_done(fingerprint, STEP_WORKSPACE):
+        workspace_status = "Already provisioned (see prior run)"
+        logger.info("Step 3: Google Workspace account already provisioned for this hire, skipping")
+    elif not cfg.google_workspace_domain:
+        workspace_status = "Not provisioned: GOOGLE_WORKSPACE_DOMAIN not configured"
+        logger.warning("Step 3: GOOGLE_WORKSPACE_DOMAIN not set, skipping Google Workspace provisioning")
+    else:
+        logger.info("Step 3: Provisioning Google Workspace account via Domain-Wide Delegation")
+        try:
+            local_part = full_name.strip().lower().replace(" ", ".") or "new.hire"
+            primary_email = f"{local_part}@{cfg.google_workspace_domain}"
+            workspace.provision_user(
+                primary_email=primary_email,
+                first_name=cfg.new_hire_first_name,
+                last_name=cfg.new_hire_last_name,
+            )
+            workspace_status = f"Provisioned: {primary_email}"
+            state.mark_step_done(fingerprint, STEP_WORKSPACE, {"email": primary_email})
+            logger.info(f"[OK] Google Workspace account provisioned: {primary_email}")
+        except NotImplementedError as e:
+            workspace_status = "Not provisioned: Google Workspace (DWD) is not set up for this workspace yet"
+            logger.warning(
+                "Step 3: Google Workspace provisioning is not available -- "
+                "GOOGLEDWD is not configured in this Scalekit workspace. "
+                "See README Prerequisites. Continuing to Notion and Slack."
+            )
+            logger.debug(f"Detail: {e}")
+        except ConnectorUnavailableError as e:
+            workspace_status = "Not provisioned: Google Workspace connector not configured"
+            logger.warning(f"Step 3: Google Workspace connector is not configured: {e}. Continuing to Notion and Slack.")
+        except ConnectorError as e:
+            workspace_status = f"FAILED: {e}"
+            logger.error(f"Step 3: Google Workspace provisioning failed: {e}. Continuing to Notion and Slack.")
+
+    # --- Step 4: Notion onboarding doc ---
+    if state.is_step_done(fingerprint, STEP_NOTION):
+        logger.info("Step 4: Notion onboarding page already created for this hire, skipping")
+    else:
+        logger.info("Step 4: Creating Notion onboarding page")
+        title = build_onboarding_page_title(cfg)
+        markdown_body = build_onboarding_page_markdown(cfg, workspace_status, deel_status, deel_contract_id)
+        try:
+            result = notion.upsert_onboarding_page(cfg.notion_parent_page_id, title, markdown_body)
+            page_id = ((result.get("pages") or [{}])[0]).get("id", "")
+            state.mark_step_done(fingerprint, STEP_NOTION, {"page_id": page_id})
+            logger.info(f"[OK] Notion onboarding page ready: {page_id}")
+        except ConnectorError as e:
+            logger.error(f"Step 4: Failed to create Notion onboarding page: {e}. Continuing to Slack.")
+
+    # --- Step 5: Slack welcome message ---
+    if state.is_step_done(fingerprint, STEP_SLACK):
+        logger.info("Step 5: Slack welcome message already posted for this hire, skipping")
+    else:
+        logger.info("Step 5: Posting welcome message to Slack")
+        channel_id = slack.resolve_channel_id(cfg.slack_welcome_channel)
+        if not channel_id:
+            logger.error(
+                f"Step 5: Could not resolve Slack channel '{cfg.slack_welcome_channel}'. "
+                f"Confirm the channel exists and the bot is a member, or set "
+                f"SLACK_WELCOME_CHANNEL to a literal channel ID."
+            )
+        else:
+            message = build_welcome_message(cfg)
+            try:
+                slack.send_welcome_message(channel_id, message)
+                state.mark_step_done(fingerprint, STEP_SLACK, {"channel_id": channel_id})
+                logger.info(f"[OK] Welcome message posted to Slack ({cfg.slack_welcome_channel} -> {channel_id})")
+            except ConnectorError as e:
+                logger.error(f"Step 5: Failed to post Slack welcome message: {e}")
+
+    outcomes = {
+        "deel": "OK" if state.is_step_done(fingerprint, STEP_DEEL) else "FAILED",
+        "workspace": "OK" if state.is_step_done(fingerprint, STEP_WORKSPACE) else "SKIPPED",
+        "notion": "OK" if state.is_step_done(fingerprint, STEP_NOTION) else "FAILED",
+        "slack": "OK" if state.is_step_done(fingerprint, STEP_SLACK) else "FAILED",
+    }
+    summary = ", ".join(f"{k.capitalize()}: {v}" for k, v in outcomes.items())
+    logger.info(f"[SUMMARY] {full_name}: {summary}")
+    return 0
 
 
 def main() -> int:
@@ -344,42 +328,66 @@ def main() -> int:
     state = StateManager()
 
     logger.info("Step 0: Checking connector auth")
-    all_required_active = True
-    for connector_name, identifier in cfg.get_connector_users().items():
+    deel_conn = Connector(actions, cfg.deel_connector, cfg.deel_user)
+    deel_active = deel_conn.check_auth()
+    other_active = True
+    for connector_name, identifier in cfg.get_connector_users():
+        if connector_name == cfg.deel_connector and identifier == cfg.deel_user:
+            continue
         conn = Connector(actions, connector_name, identifier)
         active = conn.check_auth()
         is_workspace = connector_name == cfg.google_workspace_connector
         if not active and not is_workspace:
-            all_required_active = False
+            other_active = False
 
-    # Google Workspace is checked above too (for visibility in the logs) but
-    # never flips all_required_active: it's optional/conditional (see
-    # provisioning.py module docstring and README Prerequisites).
-    if cfg.google_workspace_user:
-        pass  # already checked in the loop above
-    else:
+    if not cfg.google_workspace_user:
         logger.warning(
             f"{cfg.google_workspace_connector} (no GOOGLE_WORKSPACE_USER configured) -- "
-            f"NOT CONFIGURED. Google Workspace provisioning will be skipped for every "
-            f"new hire this run. See README Prerequisites to set this up."
+            f"NOT CONFIGURED. Google Workspace provisioning will be skipped for this hire. "
+            f"See README Prerequisites to set this up."
         )
 
-    if not all_required_active:
-        logger.warning("Some required connectors are not authorized. Proceeding anyway -- affected steps will be skipped or fail.")
+    if not deel_active:
+        # Unlike Notion/Slack/Workspace, Deel is the one connector this
+        # agent cannot degrade around: it's the only real creation path
+        # this agent has (see module docstring). Fail fast here rather
+        # than let the real failure surface a few seconds later at Step 2
+        # with less context.
+        logger.error(
+            "Deel is not authorized. This agent cannot create a real new-hire record without "
+            "it -- fix authorization before re-running."
+        )
+        return 1
 
-    logger.info("Step 0.5: Verifying Gusto is queryable and Notion parent page is accessible")
-    gusto = GustoConnector(actions, cfg.gusto_user, cfg.gusto_connector)
+    if not other_active:
+        logger.warning(
+            "Notion and/or Slack are not authorized. Proceeding anyway -- the Deel creation can "
+            "still succeed; the onboarding doc and/or welcome message will fail with a warning if "
+            "their connector stays unauthorized."
+        )
+
+    logger.info("Step 0.5: Verifying Deel is reachable and the Notion parent page is accessible")
+    deel = DeelConnector(actions, cfg.deel_user, cfg.deel_connector)
     notion = NotionConnector(actions, cfg.notion_user, cfg.notion_connector)
     try:
-        verify_gusto_queryable(gusto)
+        verify_deel_writable(deel)
         verify_notion_parent_page(notion, cfg.notion_parent_page_id)
     except ProvisioningError as e:
         logger.error(str(e))
         return 1
 
+    if cfg.new_hire_dry_run:
+        logger.info(
+            "NEW_HIRE_DRY_RUN=true: no real Deel record will be created this run. "
+            "Set NEW_HIRE_DRY_RUN=false once you've confirmed the resolved IDs/details look correct."
+        )
+
     if cfg.polling_mode:
         logger.info(
-            f"Polling mode enabled (interval: {cfg.poll_interval_minutes}m, press Ctrl+C to stop)"
+            f"Polling mode enabled (interval: {cfg.poll_interval_minutes}m, press Ctrl+C to stop). "
+            f"Since provisioning one hire is a one-shot action once completed, polling here "
+            f"re-checks whether the CONFIGURED hire has been fully processed yet -- it does not "
+            f"re-create a hire that already completed (see state.py)."
         )
         consecutive_errors = 0
         cycle = 0
@@ -393,12 +401,17 @@ def main() -> int:
             logger.info(f"Polling cycle #{cycle}")
 
             try:
-                results = run_cycle(cfg, actions, state)
+                code = run_cycle(cfg, actions, state)
                 consecutive_errors = 0
-                if not results:
-                    logger.info("No new hires found this cycle")
-                else:
-                    logger.info(f"[OK] Processed {len(results)} new hire(s) this cycle")
+                if code == 0:
+                    logger.info("[OK] Hire processed (or already complete) -- nothing further to do")
+                    return 0
+                elif code == 2:
+                    logger.info("Deel creation failed -- stopping polling loop")
+                    return 2
+            except ShutdownRequested as e:
+                logger.info(str(e))
+                return 130
             except Exception as e:
                 consecutive_errors += 1
                 logger.error(f"Error during cycle: {e}", exc_info=True)
@@ -413,18 +426,11 @@ def main() -> int:
                 time.sleep(1)
 
     else:
-        results = run_cycle(cfg, actions, state)
-        if not results:
-            logger.info("[OK] No new hires found in Gusto this run -- nothing to provision")
-            return 0
-
-        any_ok = any(v == "OK" for outcome in results for v in outcome.values())
-        if not any_ok:
-            logger.error("New hire(s) were found but nothing could be provisioned this run")
-            return 2
-
-        logger.info(f"[OK] Processed {len(results)} new hire(s)")
-        return 0
+        try:
+            return run_cycle(cfg, actions, state)
+        except ShutdownRequested as e:
+            logger.info(str(e))
+            return 130
 
 
 if __name__ == "__main__":

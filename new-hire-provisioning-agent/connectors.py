@@ -1,45 +1,71 @@
 """
-Connector wrappers for Gusto, Google Workspace (via Domain-Wide Delegation),
-Notion, and Slack.
+Connector wrappers for Deel (via DeelMCP), Google Workspace (via Domain-Wide
+Delegation), Notion, and Slack.
 
 All APIs go through Scalekit's actions.execute_tool(). No direct API imports,
 no token management, no credential storage in code.
 
 Tool names and parameter shapes below are verified LIVE against this
-workspace's Scalekit environment (env_20324953475777334) at build time --
-not guessed:
+workspace's Scalekit environment (env_20324953475777334):
 
-  - gustomcp_list_employees(page=, per=, search_term=, sort_by=, onboarded=,
-        onboarded_active=, terminated=, location_uuid=, payroll_uuid=,
-        uuids=, include=)                                      (GUSTOMCP,
-        connector "gustomcp-SoSOMZ20")
-      -> MCP envelope: {"content": [{"type": "text", "text": "<json-array-string>"}]}
-      Verified live: called with {"per": 10, "page": 1} against the connected
-      sandbox company and received a real (empty) JSON array back. The
-      connector's OAuth token later expired mid-build (status flipped from
-      ACTIVE to EXPIRED between calls) -- confirming this is a real,
-      observed failure mode this agent must handle gracefully (see
-      Connector.check_auth and GustoConnector below), not a hypothetical one.
-  - gustomcp_get_employee(employee_uuid=, include=)              (GUSTOMCP)
-      -> Confirmed via Scalekit's tool catalog (search_tools): employee_uuid
-         is required; calling with a syntactically-valid-but-nonexistent UUID
-         returned "Resource not found" (not "missing required parameter"),
-         confirming the exact parameter name live. include accepts a
-         comma-separated list: all_compensations, all_home_addresses,
-         company_name, current_home_address, custom_fields, portal_invitations.
-      -> MCP envelope, same shape as list_employees.
+  - deelmcp_org_direct_employee_create(data={client:{legal_entity:{id=},
+        team:{id=}, department:{id=}}, employee:{email=, work_email=,
+        country=, state=, first_name=, last_name=, nationality=},
+        employment:{type="FULL_TIME"|"PART_TIME", job_title=, seniority=,
+        start_date=}, compensation_details:{salary=, currency=, scale=}})
+        (DEELMCP, connector "deelmcp-zTWsHKTh")
+      -> "Creates a direct employee record under the organization's own
+         legal entity, provisioning both a person and an employment
+         contract. For onboarding employees managed through your own
+         payroll providers." This is the real creation tool Gusto's
+         entirely read-only catalog never had. Verified live end-to-end: a
+         real employee was created and returned a real id, contract_id,
+         and echoed employment/compensation details.
+      -> employee.state is REQUIRED for at least India (country=IN) even
+         though the schema marks it optional -- confirmed live: omitting it
+         returns a real 400 "No state was selected". Likely required for
+         other countries with state/province-level tax jurisdictions too;
+         not exhaustively tested here.
+      -> employment.seniority wants the SENIORITY NAME STRING (e.g. "Mid
+         (Individual Contributor Level 2)"), not the numeric ID that
+         deelmcp_lookup_seniority_list's own response returns as "id" --
+         confirmed live: the numeric ID string ("2") was rejected with a
+         real 404 "Seniority not found"; the name string from the same
+         lookup response succeeded.
+      -> Response is a single object under "data" (not a list).
+  - deelmcp_org_legal_entity_list() / deelmcp_org_team_list() /
+        deelmcp_org_department_list()                              (DEELMCP)
+      -> All three verified live to be genuine no-argument bulk listings
+         (unlike deelmcp_hris_org_chart_get, which requires a pre-known
+         GUID and cannot be used as a bulk fetch -- see the sibling
+         pto-leave-request-agent's connectors.py for that finding). Used to
+         resolve DEEL_LEGAL_ENTITY_ID/DEEL_TEAM_ID/DEEL_DEPARTMENT_ID
+         automatically at startup instead of requiring them as hardcoded
+         config, when exactly one candidate exists; ambiguity (more than
+         one legal entity or team) falls back to requiring the env var.
+  - deelmcp_lookup_seniority_list()                                 (DEELMCP)
+      -> Real, verified live: returns id/name/level triples (e.g.
+         {"id": 2, "name": "Mid (Individual Contributor Level 2)",
+         "level": 2}). Used to resolve NEW_HIRE_SENIORITY (a short config
+         value like "mid") to the real name string org_direct_employee_create
+         needs.
+  - No delete/terminate/offboard tool exists anywhere in this DEELMCP
+    catalog for a direct employee (confirmed live by exhausting every
+    plausible query: "direct_employee_delete", "_terminate", "_offboard",
+    "contract_terminate", "hris_employee_terminate", "worker_offboard" --
+    all zero results). This means a mistakenly-created employee record
+    cannot be cleaned up through this agent or any other Scalekit tool;
+    see README for why NEW_HIRE_DRY_RUN exists and is recommended for
+    first-time setup verification.
+
   - notionmcp_notion-create-pages(parent={"type": "page_id", "page_id": ...},
         pages=[{"properties": {"title": ...}, "content": "<markdown>"}])
                                                                   (NOTIONMCP,
         connector "notionmcp-chAb8Lfz")
-      -> Verified live: created a real test page
-         (id 3ad26e34-1074-81f2-826d-c561e8a485f0) under an existing parent
-         page in this workspace. Note "parent" is a TOP-LEVEL kwarg alongside
-         "pages", not nested inside each page dict -- confirmed by both a
-         live 400 (parent nested inside a page dict -> "Unrecognized key:
-         parent") and a live success (parent top-level). properties.title is
-         a plain string, content is markdown text, matching the shape
-         reused from performance-review-collector-agent's NotionConnector.
+      -> Verified live: created a real test page under an existing parent
+         page in this workspace. "parent" is a TOP-LEVEL kwarg alongside
+         "pages", not nested inside each page dict. properties.title is a
+         plain string, content is markdown text.
   - notionmcp_notion-search(query=)                               (NOTIONMCP)
       -> Verified live. query must be a non-empty string (empty string
          returns a 400 "too_small" validation error) -- pass at least one
@@ -47,24 +73,19 @@ not guessed:
   - slackmcp_slack_search_channels(query=),
     slackmcp_slack_send_message(channel_id=, message=)            (SLACKMCP,
         connector "slackmcp")
-      -> Verified live: search_channels("dev") returned a real channel
-         (#bugs-devops-project, C0AKYEQ11L6) with a markdown "results" string
-         (not structured JSON), and send_message posted a real Slack message
-         to that channel, confirmed by a returned message_link/message_ts.
+      -> Verified live: search_channels returned a real channel with a
+         markdown "results" string (not structured JSON), and send_message
+         posted a real Slack message, confirmed by a returned
+         message_link/message_ts.
 
-  - Google Workspace (DWD): the GOOGLEDWD connector shows setup: not_configured
-    in this workspace and has ZERO connected accounts and ZERO discoverable
-    tools via Scalekit's tool catalog (search_tools with connector=GOOGLEDWD
-    and multiple Admin-SDK-style queries, e.g. "create user", "users insert
-    directory", returned 0 GOOGLEDWD tool results every time -- the catalog
-    genuinely has nothing registered for this connector in this workspace
-    yet). get_or_create_connected_account("googledwd", ...) returns
-    RESOURCE_NOT_FOUND live, confirmed. Per the explicit instruction not to
-    guess/hallucinate tool names for an unverifiable connector, the method
-    below is built with a clear signature and TODO docstring instead of a
-    fabricated tool name. See README "Google Workspace Provisioning" section
-    for the exact setup this requires before this method can be implemented
-    for real.
+  - Google Workspace (DWD): the GOOGLEDWD connector shows setup:
+    not_configured in this workspace and has ZERO connected accounts and
+    ZERO discoverable tools via Scalekit's tool catalog. Per the explicit
+    instruction not to guess/hallucinate tool names for an unverifiable
+    connector, the method below is built with a clear signature and
+    NotImplementedError instead of a fabricated tool name. See README
+    "Google Workspace Provisioning" section for the exact setup this
+    requires before this method can be implemented for real.
 """
 
 import json
@@ -91,11 +112,11 @@ class ConnectorUnavailableError(ConnectorError):
 
 def _unwrap_mcp_envelope(data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    MCP-based connectors (GUSTOMCP, NOTIONMCP, SLACKMCP, ...) return
+    MCP-based connectors (DEELMCP, NOTIONMCP, SLACKMCP) return
     {"content": [{"type": "text", "text": "<json-or-plain-string>"}]} instead
     of a flat payload dict -- verified live against all three. If the decoded
-    JSON is a bare list (e.g. gustomcp_list_employees's response), it's
-    wrapped as {"items": [...]} so callers always get a dict back.
+    JSON is a bare list, it's wrapped as {"items": [...]} so callers always
+    get a dict back.
     """
     if not isinstance(data, dict) or "content" not in data:
         return data
@@ -204,128 +225,115 @@ def _is_not_found_error(e: Exception) -> bool:
     return "RESOURCE_NOT_FOUND" in text or type(e).__name__ == "ScalekitNotFoundException"
 
 
-class GustoConnector(Connector):
+class DeelConnector(Connector):
     """
-    Gusto API operations (via the GustoMCP connector) -- list employees to
-    detect new hires, and fetch a single employee's full profile.
-
-    connector_name must match the exact connection name shown in the
-    Scalekit dashboard (e.g. "gustomcp-SoSOMZ20"), not the generic "GUSTOMCP"
-    provider label -- Scalekit auto-suffixes connection names per workspace.
+    Deel API operations -- resolve the org's legal entity/team/department and
+    seniority-level catalog, and create a real direct-employee record for a
+    new hire.
     """
 
-    def __init__(self, actions, identifier: str, connector_name: str = "gustomcp-SoSOMZ20"):
+    def __init__(self, actions, identifier: str, connector_name: str = "deelmcp-zTWsHKTh"):
         super().__init__(actions, connector_name, identifier)
 
-    def list_employees(
+    def list_legal_entities(self) -> List[Dict]:
+        data = self.execute_tool("deelmcp_org_legal_entity_list") or {}
+        return data.get("data") or data.get("items") or []
+
+    def list_teams(self) -> List[Dict]:
+        data = self.execute_tool("deelmcp_org_team_list") or {}
+        return data.get("data") or data.get("items") or []
+
+    def list_departments(self) -> List[Dict]:
+        data = self.execute_tool("deelmcp_org_department_list") or {}
+        return data.get("data") or data.get("items") or []
+
+    def list_seniorities(self) -> List[Dict]:
+        """Real predefined seniority levels: {"id": int, "name": str, "level": int}."""
+        data = self.execute_tool("deelmcp_lookup_seniority_list") or {}
+        return data.get("data") or data.get("items") or []
+
+    def resolve_seniority_name(self, seniority_query: str) -> Optional[str]:
+        """
+        Resolve a short config value (e.g. "mid", "senior") to the real
+        seniority NAME STRING org_direct_employee_create requires -- not the
+        numeric ID deelmcp_lookup_seniority_list also returns, which the
+        create tool rejects with a real 404 "Seniority not found" (verified
+        live). Matches case-insensitively against a substring of the real
+        name.
+        """
+        query_lower = seniority_query.strip().lower()
+        for level in self.list_seniorities():
+            name = level.get("name", "")
+            if query_lower in name.lower():
+                return name
+        return None
+
+    def create_direct_employee(
         self,
-        onboarded: Optional[bool] = None,
-        terminated: Optional[bool] = None,
-        page: int = 1,
-        per: int = 100,
-    ) -> List[Dict]:
+        legal_entity_id: str,
+        team_id: str,
+        email: str,
+        work_email: str,
+        country: str,
+        first_name: str,
+        last_name: str,
+        nationality: str,
+        job_title: str,
+        seniority_name: str,
+        start_date: str,
+        salary: float,
+        currency: str,
+        state: Optional[str] = None,
+        department_id: Optional[str] = None,
+        employment_type: str = "FULL_TIME",
+    ) -> Dict:
         """
-        Fetch one page of employees for the connected Gusto company, newest
-        first. sort_by="created_at:desc" is passed so a scan naturally checks
-        the most-recently-created records first, which matters once a company
-        has more than one page of employees.
+        Create a real direct-employee record: a person plus an employment
+        contract under the organization's own legal entity. This is the
+        genuine creation capability Gusto's entirely read-only catalog in
+        this workspace never had.
+
+        state is required for at least India (verified live: omitting it
+        for country="IN" returns a real 400 "No state was selected") -- pass
+        it whenever your target country needs one; Deel's own API is the
+        source of truth for which countries require it, not this agent.
         """
-        kwargs: Dict[str, Any] = {"page": page, "per": per, "sort_by": "created_at:desc"}
-        if onboarded is not None:
-            kwargs["onboarded"] = onboarded
-        if terminated is not None:
-            kwargs["terminated"] = terminated
+        client: Dict[str, Any] = {"legal_entity": {"id": legal_entity_id}, "team": {"id": team_id}}
+        if department_id:
+            client["department"] = {"id": department_id}
 
-        data = self.execute_tool("gustomcp_list_employees", **kwargs) or {}
-        return data.get("items") or data.get("employees") or []
+        employee: Dict[str, Any] = {
+            "email": email,
+            "work_email": work_email,
+            "country": country,
+            "first_name": first_name,
+            "last_name": last_name,
+            "nationality": nationality,
+        }
+        if state:
+            employee["state"] = state
 
-    def get_employee(self, employee_uuid: str) -> Dict:
-        """
-        Fetch full profile for a single employee: name, hire date, job,
-        location. include=company_name is requested so the onboarding doc
-        and Slack message can reference the employer name without a second
-        round-trip.
-        """
-        data = self.execute_tool(
-            "gustomcp_get_employee",
-            employee_uuid=employee_uuid,
-            include="company_name",
-        ) or {}
-        return data
-
-    def find_new_hires(
-        self,
-        lookback_days: int,
-        lookahead_days: int,
-        max_pages: int = 5,
-        page_size: int = 100,
-    ) -> List[Dict]:
-        """
-        Scan employees (newest-created first) and return those whose
-        onboarding is not yet complete OR whose start date falls within the
-        [today - lookback_days, today + lookahead_days] window. This is a
-        heuristic for "looks like a new hire record", not a literal Gusto
-        field: Gusto's onboarded flag reflects self-service paperwork
-        completion, which can lag or lead the actual start date, so both
-        signals are checked and either one qualifies a record.
-
-        Only NOT-terminated employees are considered (terminated=False),
-        since a re-scan should never resurface someone who left before ever
-        being provisioned.
-
-        Stops paginating after max_pages (a generous default -- 500
-        employees at the default page_size) as a safety bound against
-        scanning an entire large company's history every run; combined with
-        newest-first sorting, real new hires are always in the earliest
-        pages anyway.
-        """
-        import datetime
-
-        today = datetime.date.today()
-        window_start = today - datetime.timedelta(days=lookback_days)
-        window_end = today + datetime.timedelta(days=lookahead_days)
-
-        candidates = []
-        for page in range(1, max_pages + 1):
-            batch = self.list_employees(terminated=False, page=page, per=page_size)
-            if not batch:
-                break
-
-            for employee in batch:
-                if _looks_like_new_hire(employee, window_start, window_end):
-                    candidates.append(employee)
-
-            if len(batch) < page_size:
-                break  # last page
-
-        return candidates
-
-
-def _looks_like_new_hire(employee: Dict, window_start, window_end) -> bool:
-    """
-    True if `employee` (a summary record from gustomcp_list_employees) looks
-    like a new hire: onboarding not yet complete, or a start_date within the
-    configured lookback/lookahead window. Missing/unparseable start_date
-    falls back to onboarding status alone rather than excluding the record,
-    since a record worth provisioning shouldn't be silently dropped just
-    because one field is absent.
-    """
-    import datetime
-
-    onboarded = employee.get("onboarded")
-    if onboarded is False:
-        return True
-
-    start_date_raw = employee.get("start_date") or employee.get("hire_date") or employee.get("jobs", [{}])[0].get("hire_date") if employee.get("jobs") else None
-    if not start_date_raw:
-        return bool(onboarded is False)
-
-    try:
-        start_date = datetime.date.fromisoformat(str(start_date_raw)[:10])
-    except ValueError:
-        return bool(onboarded is False)
-
-    return window_start <= start_date <= window_end
+        payload = {
+            "client": client,
+            "employee": employee,
+            "employment": {
+                "type": employment_type,
+                "job_title": job_title,
+                "seniority": seniority_name,
+                "start_date": start_date,
+            },
+            "compensation_details": {
+                "salary": salary,
+                "currency": currency,
+            },
+        }
+        # The tool's own input_schema requires the whole payload wrapped
+        # under a single top-level "data" key (confirmed live: unpacking
+        # payload's keys as separate top-level kwargs instead produced a
+        # real 400 "data" Required error) -- pass it as one data= kwarg,
+        # not **payload.
+        data = self.execute_tool("deelmcp_org_direct_employee_create", data=payload) or {}
+        return data.get("data") or data
 
 
 class GoogleWorkspaceConnector(Connector):
@@ -372,7 +380,7 @@ class GoogleWorkspaceConnector(Connector):
 
         NOT YET IMPLEMENTED: see class docstring. Raises NotImplementedError
         unconditionally so a caller can never silently believe an account was
-        created when it wasn't -- run_flow.py's Step 2 catches this
+        created when it wasn't -- run_flow.py's Step 3 catches this
         specifically and logs a clear "Workspace: SKIPPED" outcome rather
         than treating it as an unexpected crash.
         """
@@ -392,11 +400,6 @@ class NotionConnector(Connector):
     """
     Notion API operations (via the NotionMCP connector) -- create a new-hire
     onboarding page under a parent/hub page.
-
-    Tool shapes verified live in this build (see module docstring) and reused
-    from performance-review-collector-agent's NotionConnector, which
-    established the same notionmcp_notion-create-pages/-search shapes
-    against this same NOTIONMCP connection.
     """
 
     def __init__(self, actions, identifier: str, connector_name: str = "notionmcp-chAb8Lfz"):

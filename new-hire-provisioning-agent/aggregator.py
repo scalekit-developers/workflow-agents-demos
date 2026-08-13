@@ -1,162 +1,85 @@
 """
-Content builders: turn a Gusto employee record into a Notion onboarding page
-(title + markdown body) and a Slack welcome message.
-
-Degrades gracefully on missing fields
---------------------------------------
-Gusto employee records vary in completeness -- a freshly-created record may
-be missing a start date, job title, department, or manager before onboarding
-paperwork is finished. Every field access below falls back to a clear
-"Not yet set in Gusto" placeholder rather than raising, and any missing field
-is collected into a `warnings` list so run_flow.py can log exactly what was
-incomplete about the source record instead of silently generating a
-half-empty document.
+Content builders: turn the configured new-hire details (plus the real Deel
+record created for them) into a Notion onboarding page (title + markdown
+body) and a Slack welcome message.
 """
 
-import datetime
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-_MISSING = "Not yet set in Gusto"
+
+def build_full_name(cfg) -> str:
+    return f"{cfg.new_hire_first_name} {cfg.new_hire_last_name}".strip()
 
 
-def _get_job(employee: Dict) -> Dict:
-    jobs = employee.get("jobs") or []
-    return jobs[0] if jobs else {}
-
-
-def _employee_full_name(employee: Dict) -> str:
-    first = employee.get("first_name", "").strip()
-    last = employee.get("last_name", "").strip()
-    full = f"{first} {last}".strip()
-    return full or employee.get("preferred_name") or "New Hire"
-
-
-def extract_onboarding_fields(employee: Dict) -> Tuple[Dict, List[str]]:
-    """
-    Pull the fields this agent cares about out of a raw Gusto employee
-    record (from gustomcp_get_employee, ideally; falls back to whatever a
-    list_employees summary record has if the detail fetch failed), and
-    return (fields, warnings) where warnings lists which expected fields
-    were missing.
-    """
-    warnings: List[str] = []
-    job = _get_job(employee)
-
-    full_name = _employee_full_name(employee)
-    if full_name == "New Hire":
-        warnings.append("employee name")
-
-    start_date = employee.get("start_date") or job.get("hire_date") or ""
-    if not start_date:
-        warnings.append("start date")
-
-    title = job.get("title") or ""
-    if not title:
-        warnings.append("job title")
-
-    department = (
-        job.get("department")
-        or (job.get("location") or {}).get("name")
-        or ""
-    )
-    if not department:
-        warnings.append("department")
-
-    company_name = employee.get("company_name") or ""
-    email = employee.get("email") or employee.get("work_email") or ""
-
-    fields = {
-        "full_name": full_name,
-        "start_date": start_date or _MISSING,
-        "title": title or _MISSING,
-        "department": department or _MISSING,
-        "company_name": company_name,
-        "email": email,
-        "employee_id": employee.get("uuid") or employee.get("id") or "",
-    }
-    return fields, warnings
-
-
-def build_onboarding_page_title(fields: Dict) -> str:
+def build_onboarding_page_title(cfg) -> str:
     """Notion page title for the new hire's onboarding doc."""
-    return f"{fields['full_name']} - Onboarding"
+    return f"{build_full_name(cfg)} - Onboarding"
 
 
-def build_onboarding_page_markdown(fields: Dict, warnings: List[str], workspace_status: str) -> str:
+def build_onboarding_page_markdown(
+    cfg,
+    workspace_status: str,
+    deel_status: str,
+    deel_contract_id: str = "",
+) -> str:
     """
-    Markdown body for the new hire's Notion onboarding page. workspace_status
-    is a short human-readable outcome string for the Google Workspace step
-    (e.g. "Provisioned: jane.doe@acme.com", "Not provisioned: Google
-    Workspace connector not configured yet"), included so the doc always
-    reflects what actually happened rather than assuming success.
+    Markdown body for the new hire's Notion onboarding page. Both
+    deel_status and workspace_status are short human-readable outcome
+    strings (e.g. "Created: contract 34rpznp", "Not provisioned: Google
+    Workspace (DWD) is not set up for this workspace yet"), included so the
+    doc always reflects what actually happened rather than assuming
+    success.
     """
     lines = [
-        f"# Welcome, {fields['full_name']}!",
+        f"# Welcome, {build_full_name(cfg)}!",
         "",
         "## Role Details",
-        f"- **Start date:** {fields['start_date']}",
-        f"- **Title:** {fields['title']}",
-        f"- **Department:** {fields['department']}",
+        f"- **Start date:** {cfg.new_hire_start_date}",
+        f"- **Title:** {cfg.new_hire_job_title}",
+        f"- **Employment type:** {cfg.new_hire_employment_type}",
+        f"- **Country:** {cfg.new_hire_country}",
+        "",
+        "## Accounts & Access",
+        f"- **Deel record:** {deel_status}",
+        f"- **Google Workspace:** {workspace_status}",
+        "",
+        "## Onboarding Checklist",
+        "- [ ] Complete Deel self-onboarding paperwork",
+        "- [ ] Sign in to Google Workspace account and set a password",
+        "- [ ] Join core team Slack channels",
+        "- [ ] 1:1 with manager in week one",
+        "- [ ] Review team documentation and onboarding plan",
+        "",
     ]
-    if fields.get("company_name"):
-        lines.append(f"- **Company:** {fields['company_name']}")
-    lines.append("")
 
-    lines.append("## Accounts & Access")
-    lines.append(f"- **Google Workspace:** {workspace_status}")
-    lines.append("")
-
-    lines.append("## Onboarding Checklist")
-    lines.append("- [ ] Complete Gusto self-onboarding paperwork (I-9, W-4, direct deposit)")
-    lines.append("- [ ] Sign in to Google Workspace account and set a password")
-    lines.append("- [ ] Join core team Slack channels")
-    lines.append("- [ ] 1:1 with manager in week one")
-    lines.append("- [ ] Review team documentation and onboarding plan")
-    lines.append("")
-
-    if warnings:
-        lines.append("## Notes")
-        lines.append(
-            f"_This document was generated automatically. The following fields "
-            f"were not yet available in Gusto at generation time and may need "
-            f"to be filled in manually once set: {', '.join(warnings)}._"
-        )
+    if deel_contract_id:
+        lines.append(f"_Deel contract ID: {deel_contract_id}_")
         lines.append("")
 
-    lines.append("_Generated by your New Hire Provisioning Agent from live Gusto data._")
+    lines.append("_Generated by your New Hire Provisioning Agent from a real Deel record._")
     return "\n".join(lines)
 
 
-def build_welcome_message(fields: Dict, warnings: List[str]) -> str:
+def build_welcome_message(cfg) -> str:
     """
     Slack welcome message text for the new hire's start, posted to a shared
-    team channel (not a DM). Keeps the same graceful-degradation philosophy
-    as the Notion doc: missing fields show as a placeholder rather than
-    breaking message formatting (e.g. an empty title/department).
+    team channel (not a DM).
     """
-    lines = [f"*Welcome to the team, {fields['full_name']}!* :wave:", ""]
+    lines = [f"*Welcome to the team, {build_full_name(cfg)}!* :wave:", ""]
 
     details = []
-    if fields["title"] != _MISSING:
-        details.append(f"joining as *{fields['title']}*")
-    if fields["department"] != _MISSING:
-        details.append(f"in *{fields['department']}*")
-    if fields["start_date"] != _MISSING:
-        details.append(f"starting *{fields['start_date']}*")
+    if cfg.new_hire_job_title:
+        details.append(f"joining as *{cfg.new_hire_job_title}*")
+    if cfg.new_hire_start_date:
+        details.append(f"starting *{cfg.new_hire_start_date}*")
 
     if details:
         lines.append(" ".join(details).capitalize() + ".")
-    else:
-        lines.append("Full role details are still being finalized in Gusto.")
 
     lines.append("")
     lines.append("Please give them a warm welcome when you see them online!")
-
-    if warnings:
-        lines.append("")
-        lines.append(f"_Note: {', '.join(warnings)} not yet set in Gusto for this record._")
 
     return "\n".join(lines)
