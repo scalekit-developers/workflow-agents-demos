@@ -1,0 +1,5 @@
+requests==2.32.3
+python-dotenv==1.0.1
+langchain-core
+langchain
+scalekit-sdk-python>=1.0.0
