@@ -53,7 +53,7 @@ ALL_STEPS = (STEP_DEEL, STEP_WORKSPACE, STEP_NOTION, STEP_SLACK)
 
 
 def compute_hire_fingerprint(first_name: str, last_name: str, personal_email: str, start_date: str) -> str:
-    """Build a stable idempotency key for one new-hire request."""
+    """Build a stable idempotency key for one create-mode new-hire request."""
     payload = {
         "first_name": first_name.strip().lower(),
         "last_name": last_name.strip().lower(),
@@ -62,6 +62,20 @@ def compute_hire_fingerprint(first_name: str, last_name: str, personal_email: st
     }
     blob = json.dumps(payload, sort_keys=True)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def compute_scan_fingerprint(deel_contract_id: str) -> str:
+    """
+    Build a stable idempotency key for a scan-mode hire, keyed on Deel's own
+    real contract ID rather than a hash of name/email/date. Unlike create
+    mode (where the record doesn't exist yet when the fingerprint is first
+    computed), scan mode only ever sees hires that already have a real Deel
+    contract -- so the contract ID itself is a simpler, equally stable key,
+    and using it directly (instead of hashing name+email+date the way create
+    mode does) means a name correction in Deel doesn't create a duplicate
+    tracked record for the same real hire.
+    """
+    return f"scan:{deel_contract_id}"
 
 
 class StateManager:

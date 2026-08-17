@@ -1,7 +1,9 @@
 """
-Content builders: turn the configured new-hire details (plus the real Deel
-record created for them) into a Notion onboarding page (title + markdown
-body) and a Slack welcome message.
+Content builders: turn a normalized Hire (see hire.py -- either configured
+directly via NEW_HIRE_* env vars in create mode, or detected from Deel's
+onboarding tracker in scan mode) plus the real Deel/Workspace outcome for
+them into a Notion onboarding page (title + markdown body) and a Slack
+welcome message.
 """
 
 import logging
@@ -10,17 +12,13 @@ from typing import Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
-def build_full_name(cfg) -> str:
-    return f"{cfg.new_hire_first_name} {cfg.new_hire_last_name}".strip()
-
-
-def build_onboarding_page_title(cfg) -> str:
+def build_onboarding_page_title(hire) -> str:
     """Notion page title for the new hire's onboarding doc."""
-    return f"{build_full_name(cfg)} - Onboarding"
+    return f"{hire.full_name} - Onboarding"
 
 
 def build_onboarding_page_markdown(
-    cfg,
+    hire,
     workspace_status: str,
     deel_status: str,
     deel_contract_id: str = "",
@@ -34,13 +32,13 @@ def build_onboarding_page_markdown(
     success.
     """
     lines = [
-        f"# Welcome, {build_full_name(cfg)}!",
+        f"# Welcome, {hire.full_name}!",
         "",
         "## Role Details",
-        f"- **Start date:** {cfg.new_hire_start_date}",
-        f"- **Title:** {cfg.new_hire_job_title}",
-        f"- **Employment type:** {cfg.new_hire_employment_type}",
-        f"- **Country:** {cfg.new_hire_country}",
+        f"- **Start date:** {hire.start_date}",
+        f"- **Title:** {hire.job_title}",
+        f"- **Employment type:** {hire.employment_type}",
+        f"- **Country:** {hire.country}",
         "",
         "## Accounts & Access",
         f"- **Deel record:** {deel_status}",
@@ -63,18 +61,18 @@ def build_onboarding_page_markdown(
     return "\n".join(lines)
 
 
-def build_welcome_message(cfg) -> str:
+def build_welcome_message(hire) -> str:
     """
     Slack welcome message text for the new hire's start, posted to a shared
     team channel (not a DM).
     """
-    lines = [f"*Welcome to the team, {build_full_name(cfg)}!* :wave:", ""]
+    lines = [f"*Welcome to the team, {hire.full_name}!* :wave:", ""]
 
     details = []
-    if cfg.new_hire_job_title:
-        details.append(f"joining as *{cfg.new_hire_job_title}*")
-    if cfg.new_hire_start_date:
-        details.append(f"starting *{cfg.new_hire_start_date}*")
+    if hire.job_title:
+        details.append(f"joining as *{hire.job_title}*")
+    if hire.start_date:
+        details.append(f"starting *{hire.start_date}*")
 
     if details:
         lines.append(" ".join(details).capitalize() + ".")

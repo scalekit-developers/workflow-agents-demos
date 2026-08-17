@@ -38,26 +38,38 @@ class Config:
         self.notion_connector = os.environ.get("NOTION_CONNECTOR", "notionmcp-chAb8Lfz")
         self.slack_connector = os.environ.get("SLACK_CONNECTOR", "slackmcp")
 
-        # Google Workspace via Domain-Wide Delegation. Shows setup:
-        # not_configured in most workspaces until an admin completes the GCP
-        # service account + DWD setup (see README Prerequisites) and connects
-        # it in the Scalekit dashboard. Until then, this agent treats it as
-        # "not authorized yet" rather than a crash -- see connectors.py
-        # GoogleWorkspaceConnector and run_flow.py Step 3.
-        self.google_workspace_connector = os.environ.get("GOOGLE_WORKSPACE_CONNECTOR", "googledwd")
+        # Google Workspace via Domain-Wide Delegation. Requires a completed
+        # GCP service account + DWD setup (see README Prerequisites) before
+        # GOOGLE_WORKSPACE_USER's connected account will reach ACTIVE. Until
+        # then, this agent treats it as "not authorized yet" rather than a
+        # crash -- see connectors.py GoogleWorkspaceConnector and
+        # run_flow.py Step 3. IMPORTANT (verified live): the impersonated
+        # subject (GOOGLE_WORKSPACE_USER) must be a Workspace SUPER ADMIN --
+        # a non-admin subject gets a real 403 from Google's Admin Directory
+        # API even with a correctly-scoped, ACTIVE DWD connection.
+        self.google_workspace_connector = os.environ.get("GOOGLE_WORKSPACE_CONNECTOR", "googledwd-f0ebCm3b")
 
         # HR admin whose identity this agent runs on behalf of. Used only as a
         # label in logs/state.
         self.hr_admin_email = os.environ.get("HR_ADMIN_EMAIL")
 
-        # The new hire's real details. Deel's catalog has no "list of pending
-        # hires waiting to be onboarded" concept -- every real Deel listing
-        # tool lists people already fully in the system -- so unlike the
-        # Gusto-based version of this agent (which scanned for existing
-        # records), this agent takes the new hire's details directly as
-        # input and creates them for real in Deel. One run provisions one
-        # new hire, matching the sibling pto-leave-request-agent's
-        # one-request-per-run shape.
+        # Which mode this run operates in:
+        #   create (default) -- one new hire's real details come directly
+        #     from NEW_HIRE_* below, and this agent creates them for real in
+        #     Deel (deelmcp_org_direct_employee_create). One run provisions
+        #     one new hire, matching the sibling pto-leave-request-agent's
+        #     one-request-per-run shape.
+        #   scan -- hires are detected FROM Deel instead, via
+        #     deelmcp_onboarding_tracker_list (see connectors.py
+        #     DeelConnector.list_onboarding_hires and hire.py). This agent
+        #     never creates a Deel record in this mode -- someone/something
+        #     else (an HR admin using Deel directly, or a separate create-
+        #     mode run) already has. NEW_HIRE_* fields below are ignored in
+        #     scan mode.
+        self.new_hire_mode = os.environ.get("NEW_HIRE_MODE", "create").strip().lower()
+
+        # The new hire's real details (create mode only -- see
+        # NEW_HIRE_MODE above).
         self.new_hire_first_name = os.environ.get("NEW_HIRE_FIRST_NAME", "")
         self.new_hire_last_name = os.environ.get("NEW_HIRE_LAST_NAME", "")
         self.new_hire_personal_email = os.environ.get("NEW_HIRE_PERSONAL_EMAIL", "")
@@ -139,26 +151,33 @@ class Config:
         if not self.notion_parent_page_id:
             errors.append("NOTION_PARENT_PAGE_ID (or NOTION_TEMPLATE_PAGE_ID)")
 
-        if not self.new_hire_first_name:
-            errors.append("NEW_HIRE_FIRST_NAME")
-        if not self.new_hire_last_name:
-            errors.append("NEW_HIRE_LAST_NAME")
-        if not self.new_hire_personal_email:
-            errors.append("NEW_HIRE_PERSONAL_EMAIL")
-        if not self.new_hire_country:
-            errors.append("NEW_HIRE_COUNTRY")
-        if not self.new_hire_nationality:
-            errors.append("NEW_HIRE_NATIONALITY")
-        if not self.new_hire_job_title:
-            errors.append("NEW_HIRE_JOB_TITLE")
-        if not self.new_hire_seniority:
-            errors.append("NEW_HIRE_SENIORITY")
-        if not self.new_hire_start_date:
-            errors.append("NEW_HIRE_START_DATE")
-        if not self.new_hire_salary:
-            errors.append("NEW_HIRE_SALARY")
-        if not self.new_hire_currency:
-            errors.append("NEW_HIRE_CURRENCY")
+        if self.new_hire_mode not in ("create", "scan"):
+            errors.append(f"NEW_HIRE_MODE (must be 'create' or 'scan', got {self.new_hire_mode!r})")
+
+        # NEW_HIRE_* fields are only required in create mode -- scan mode
+        # gets every one of these from Deel's onboarding tracker instead
+        # (see hire.py hire_from_tracker_record).
+        if self.new_hire_mode == "create":
+            if not self.new_hire_first_name:
+                errors.append("NEW_HIRE_FIRST_NAME")
+            if not self.new_hire_last_name:
+                errors.append("NEW_HIRE_LAST_NAME")
+            if not self.new_hire_personal_email:
+                errors.append("NEW_HIRE_PERSONAL_EMAIL")
+            if not self.new_hire_country:
+                errors.append("NEW_HIRE_COUNTRY")
+            if not self.new_hire_nationality:
+                errors.append("NEW_HIRE_NATIONALITY")
+            if not self.new_hire_job_title:
+                errors.append("NEW_HIRE_JOB_TITLE")
+            if not self.new_hire_seniority:
+                errors.append("NEW_HIRE_SENIORITY")
+            if not self.new_hire_start_date:
+                errors.append("NEW_HIRE_START_DATE")
+            if not self.new_hire_salary:
+                errors.append("NEW_HIRE_SALARY")
+            if not self.new_hire_currency:
+                errors.append("NEW_HIRE_CURRENCY")
 
         if errors:
             msg = f"Missing required config: {', '.join(errors)}"
@@ -170,8 +189,9 @@ class Config:
             logger.error(msg)
             sys.exit(1)
 
-        self._validate_salary()
-        self._validate_start_date()
+        if self.new_hire_mode == "create":
+            self._validate_salary()
+            self._validate_start_date()
 
     def _validate_salary(self):
         try:

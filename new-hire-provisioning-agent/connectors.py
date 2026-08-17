@@ -57,6 +57,38 @@ workspace's Scalekit environment (env_20324953475777334):
     cannot be cleaned up through this agent or any other Scalekit tool;
     see README for why NEW_HIRE_DRY_RUN exists and is recommended for
     first-time setup verification.
+  - deelmcp_onboarding_tracker_list(include_overview=True, limit=<=200,
+        cursor=, ...)                                              (DEELMCP)
+      -> CORRECTION to an earlier finding in this same file: this genuinely
+         IS a real "who is currently going through onboarding" listing tool
+         -- confirmed live against this workspace's real Deel org, returning
+         real records (including every test hire created via
+         create_direct_employee above, all showing progress.status:
+         "INVITED", plus one real pre-existing employee this agent never
+         touched). The earlier "Deel has no list of pending hires" note
+         above is still correct in the narrower sense that Deel cannot
+         detect a hire before it exists as a real Deel record -- someone
+         (an HR admin, or this agent's own create-mode) still has to create
+         it first -- but once a record exists, this tool DOES let a caller
+         detect and re-derive its status without already knowing its ID.
+      -> With include_overview=True, each record carries real, usable
+         onboarding content beyond just status: hris_profile.name/work_email
+         /email, summary (START_DATE, LOCATION_OF_WORK/country, JOB_TITLE,
+         BACKGROUND_CHECK), contract.id/created_at/status, and a
+         checklist of pending onboarding steps with due dates. It does NOT
+         carry salary/currency/seniority/nationality/state (compensation
+         and immigration-adjacent fields Deel keeps elsewhere), which is
+         why scan mode (see run_flow.py) only drives Workspace/Notion/Slack
+         from this data, never a Deel creation call.
+      -> Response is {"data": [...], "page": {"total_rows": int, "cursor":
+         str|None}} -- a real cursor-paginated list, not a single object.
+      -> The tool's own progressStatuses filter param (enum:
+         ACTIVE/INACTIVE/ONBOARDING) does NOT reliably surface INVITED
+         records -- confirmed live: progressStatuses=["ONBOARDING"] returned
+         ZERO records while an unfiltered call in the same account showed 3
+         real records with progress.status: "INVITED" at that moment. See
+         list_onboarding_hires() below, which filters client-side on the
+         real progress.status field instead of trusting this param.
 
   - notionmcp_notion-create-pages(parent={"type": "page_id", "page_id": ...},
         pages=[{"properties": {"title": ...}, "content": "<markdown>"}])
@@ -78,18 +110,47 @@ workspace's Scalekit environment (env_20324953475777334):
          posted a real Slack message, confirmed by a returned
          message_link/message_ts.
 
-  - Google Workspace (DWD): the GOOGLEDWD connector shows setup:
-    not_configured in this workspace and has ZERO connected accounts and
-    ZERO discoverable tools via Scalekit's tool catalog. Per the explicit
-    instruction not to guess/hallucinate tool names for an unverifiable
-    connector, the method below is built with a clear signature and
-    NotImplementedError instead of a fabricated tool name. See README
-    "Google Workspace Provisioning" section for the exact setup this
-    requires before this method can be implemented for real.
+  - googledwd_create_admin_user(primary_email=, given_name=, family_name=,
+        password=(optional), org_unit_path=(optional),
+        change_password_at_next_login=(optional))            (GOOGLEDWD,
+        connector "googledwd-f0ebCm3b")
+      -> REST POST https://admin.googleapis.com/admin/directory/v1/users
+         via DWD service account credentials, auth.strategy: BEARER.
+         Verified live end-to-end after fixing the connector's Domain-Wide
+         Delegation setup (see below): a real Workspace user was created
+         and confirmed readable back via googledwd_get_admin_user, then
+         removed via googledwd_delete_admin_user for cleanup.
+      -> Requires impersonating a Workspace SUPER ADMIN as the connected
+         account's identifier -- confirmed live: impersonating a non-admin
+         user (even with the DWD connection itself ACTIVE and correctly
+         scoped) gets a real 403 "Not Authorized to access this
+         resource/api" from Google's Admin Directory API itself, a
+         separate authorization layer from OAuth/DWD scope grants. In this
+         workspace, contact@infrasity.com is the verified-working Super
+         Admin subject; parv@infrasity.com and shan@infrasity.com are not
+         Super Admins and get this 403.
+      -> DWD auth setup that was required before this worked (verified
+         live, GCP service account + Workspace Admin Console): the
+         Scalekit connector's own Scopes list (Configuration tab) always
+         includes three non-removable baseline scopes -- openid,
+         userinfo.email, userinfo.profile -- alongside whichever API
+         scopes are checked (e.g. admin.directory.user). Google's DWD
+         token endpoint validates the ENTIRE requested scope set as one
+         all-or-nothing grant: authorizing only admin.directory.user in
+         Workspace Admin Console's Domain-wide Delegation entry (and
+         omitting the three baseline scopes) produced a real 401
+         "REAUTHENTICATION_NEEDED" / "Google DWD token endpoint returned
+         status 401" on every connected-account auth attempt. Adding all
+         four scopes (openid, userinfo.email, userinfo.profile,
+         admin.directory.user) to the same Client ID's DWD authorization
+         resolved it -- connected_account.status flipped from PENDING_AUTH
+         to ACTIVE.
 """
 
 import json
 import logging
+import secrets
+import string
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -247,6 +308,51 @@ class DeelConnector(Connector):
         data = self.execute_tool("deelmcp_org_department_list") or {}
         return data.get("data") or data.get("items") or []
 
+    def list_onboarding_hires(self, statuses: List[str], limit: int = 100) -> List[Dict]:
+        """
+        Real, verified live: list workers currently in Deel's onboarding
+        tracker. include_overview is always requested since scan mode needs
+        the nested hris_profile/summary/checklist fields to build
+        Notion/Slack content -- see module docstring.
+
+        `statuses` is applied CLIENT-SIDE against each record's real
+        progress.status field, not passed to the tool's own
+        progressStatuses filter -- confirmed live that the two do not agree:
+        progressStatuses only accepts ACTIVE/INACTIVE/ONBOARDING, but every
+        record actually seen in this account's tracker (including newly
+        created, not-yet-accepted hires) reports progress.status: "INVITED",
+        and filtering server-side by progressStatuses=["ONBOARDING"]
+        returned ZERO of those real INVITED records -- verified by cross-
+        checking against an unfiltered call showing all 5 real records,
+        3 of which are INVITED and were silently excluded by the ONBOARDING
+        filter. Server-side progressStatuses is passed through unset
+        (Deel's own default) and this method filters the returned records
+        against `statuses` itself instead, so callers asking for INVITED
+        hires actually get them.
+
+        Only the first page is fetched (a single HR-managed org's in-flight
+        onboarding count is expected to be well under `limit`, and
+        run_flow.py logs a clear warning if the real total_rows exceeds what
+        was fetched rather than silently truncating).
+        """
+        data = self.execute_tool(
+            "deelmcp_onboarding_tracker_list",
+            include_overview=True,
+            limit=limit,
+        ) or {}
+        records = data.get("data") or data.get("items") or []
+        page = data.get("page") or {}
+        total_rows = page.get("total_rows")
+        if isinstance(total_rows, int) and total_rows > len(records):
+            logger.warning(
+                f"deelmcp_onboarding_tracker_list reports {total_rows} total matching records but "
+                f"only {len(records)} were fetched (limit={limit}) -- some in-progress hires may not "
+                f"be processed this run. Increase the fetch limit or re-run to pick up the rest."
+            )
+
+        wanted = set(statuses)
+        return [r for r in records if (r.get("progress") or {}).get("status") in wanted]
+
     def list_seniorities(self) -> List[Dict]:
         """Real predefined seniority levels: {"id": int, "name": str, "level": int}."""
         data = self.execute_tool("deelmcp_lookup_seniority_list") or {}
@@ -344,28 +450,16 @@ class GoogleWorkspaceConnector(Connector):
     with Domain-Wide Delegation for server-to-server authentication without
     user login.").
 
-    STATUS IN THIS WORKSPACE (verified live at build time): GOOGLEDWD shows
-    setup: not_configured, has zero connected accounts, and exposes zero
-    discoverable tools via Scalekit's search_tools (tried multiple Admin-SDK-
-    style queries -- "create user", "users insert directory" -- and got 0
-    GOOGLEDWD results every time, meaning this isn't a search-relevance
-    problem, the catalog has nothing registered for it here). This means the
-    real Scalekit tool name for "create a Google Workspace user" cannot be
-    verified in this environment right now.
-
-    TOOL NAME TBD: the method below intentionally does NOT call
-    actions.execute_tool() with a guessed tool name. Once GOOGLEDWD is
-    connected (see README Prerequisites), verify the real tool name with
-    Scalekit's search_tools(connector="GOOGLEDWD") or search_connectors, then
-    replace the NotImplementedError below with the real execute_tool() call.
-    As a documented reference point only (NOT a confirmed Scalekit tool
-    name): Google's own Admin SDK Directory API exposes a REST
-    `users.insert` operation for creating a user, which is the underlying
-    operation this method is expected to wrap once the real Scalekit tool
-    name is known.
+    VERIFIED LIVE AND WORKING in this workspace (see module docstring for the
+    full DWD scope/admin-privilege setup this required). The identifier
+    passed to this connector is the impersonated Workspace subject, and it
+    MUST be a Super Admin -- confirmed live via a real 403 for two non-admin
+    subjects and a real success for a Super Admin subject. Callers should
+    default GOOGLE_WORKSPACE_USER to a confirmed Super Admin, not just any
+    HR admin's email.
     """
 
-    def __init__(self, actions, identifier: str, connector_name: str = "googledwd"):
+    def __init__(self, actions, identifier: str, connector_name: str = "googledwd-f0ebCm3b"):
         super().__init__(actions, connector_name, identifier)
 
     def provision_user(
@@ -376,24 +470,51 @@ class GoogleWorkspaceConnector(Connector):
         recovery_email: Optional[str] = None,
     ) -> Dict:
         """
-        Create a Google Workspace user account for a new hire.
+        Create a real Google Workspace user account for a new hire via the
+        Admin Directory API (googledwd_create_admin_user).
 
-        NOT YET IMPLEMENTED: see class docstring. Raises NotImplementedError
-        unconditionally so a caller can never silently believe an account was
-        created when it wasn't -- run_flow.py's Step 3 catches this
-        specifically and logs a clear "Workspace: SKIPPED" outcome rather
-        than treating it as an unexpected crash.
+        recovery_email is accepted for interface symmetry with the other
+        provisioning calls but is not part of this tool's real input schema
+        (verified live: additionalProperties: false, only primary_email,
+        given_name, family_name, org_unit_path, change_password_at_next_login,
+        password) -- it is intentionally NOT sent, since Google's own
+        create-user endpoint has no equivalent field on this call; recovery
+        email is a separate, later self-service setting on the account.
+
+        A real password is REQUIRED here -- confirmed live: omitting it
+        entirely produced a real 400 "Invalid Password" from Google's Admin
+        Directory API for this domain (this only surfaces once DWD auth
+        itself and the Super Admin impersonation are both already correct;
+        see module docstring). The tool's own schema documents password as
+        optional "unless the domain provisions users via SSO only", but this
+        domain is not SSO-only, so a real password is generated here rather
+        than assumed optional. change_password_at_next_login=True so the
+        generated password is a one-time bootstrap value only -- the new
+        hire sets their own real password on first login and this agent
+        never logs or stores the generated value beyond this call.
         """
-        raise NotImplementedError(
-            "GoogleWorkspaceConnector.provision_user() is not implemented: the "
-            "real Scalekit tool name for Google Workspace user creation via "
-            "GOOGLEDWD could not be verified in this workspace (connector is "
-            "not_configured, zero connected accounts, zero discoverable tools). "
-            "Connect GOOGLEDWD in the Scalekit dashboard (requires a GCP "
-            "service account with Domain-Wide Delegation, see README "
-            "Prerequisites), verify the real tool name via search_tools, then "
-            "implement this method against the confirmed tool name/shape."
-        )
+        temp_password = _generate_temp_password()
+        data = self.execute_tool(
+            "googledwd_create_admin_user",
+            primary_email=primary_email,
+            given_name=first_name,
+            family_name=last_name,
+            password=temp_password,
+            change_password_at_next_login=True,
+        ) or {}
+        return data.get("data") or data
+
+
+def _generate_temp_password(length: int = 20) -> str:
+    """
+    Generate a cryptographically random bootstrap password meeting Google's
+    Admin Directory API password requirements (8-100 characters). Never
+    logged: this is a one-time value the new hire immediately replaces via
+    change_password_at_next_login, not a credential this agent needs to
+    remember or hand off.
+    """
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
 class NotionConnector(Connector):
