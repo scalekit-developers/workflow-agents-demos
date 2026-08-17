@@ -17,10 +17,9 @@ workspace's Scalekit environment (env_20324953475777334):
       -> "Creates a direct employee record under the organization's own
          legal entity, provisioning both a person and an employment
          contract. For onboarding employees managed through your own
-         payroll providers." This is the real creation tool Gusto's
-         entirely read-only catalog never had. Verified live end-to-end: a
-         real employee was created and returned a real id, contract_id,
-         and echoed employment/compensation details.
+         payroll providers." Verified live end-to-end: a real employee
+         was created and returned a real id, contract_id, and echoed
+         employment/compensation details.
       -> employee.state is REQUIRED for at least India (country=IN) even
          though the schema marks it optional -- confirmed live: omitting it
          returns a real 400 "No state was selected". Likely required for
@@ -395,9 +394,7 @@ class DeelConnector(Connector):
     ) -> Dict:
         """
         Create a real direct-employee record: a person plus an employment
-        contract under the organization's own legal entity. This is the
-        genuine creation capability Gusto's entirely read-only catalog in
-        this workspace never had.
+        contract under the organization's own legal entity.
 
         state is required for at least India (verified live: omitting it
         for country="IN" returns a real 400 "No state was selected") -- pass

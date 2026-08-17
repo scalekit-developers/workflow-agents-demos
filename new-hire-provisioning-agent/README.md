@@ -323,21 +323,3 @@ rm -f state/provisioned_hires.json   # reset, e.g. to force re-provisioning for 
 | `scan` mode found 0 hires but Deel's dashboard shows hires mid-onboarding | Confirm they're actually at `progress.status: "INVITED"` and not some other sub-state; only `INVITED` is scanned for today |
 | A hire got a duplicate Slack welcome message after switching `NEW_HIRE_MODE` | Expected without a state backfill -- see [State](#state) above for why the two modes' fingerprints don't overlap |
 | `No colored output` | Colors auto-disable when output is piped; force with `FORCE_COLOR=1` |
-
-## Deployment
-
-This agent is stateless aside from the local `state/provisioned_hires.json` file, so deployment is straightforward:
-
-- **Cron / scheduled task / manual run**: since provisioning one hire is a one-shot action, this is typically run manually or triggered by an HR workflow rather than on a recurring schedule. `POLLING_MODE=true` exists for cases where you want the process to stay alive and re-check completion status rather than being re-invoked externally.
-- **Serverless (e.g. AWS Lambda, Cloud Run Jobs)**: works for the one-time mode; persist `state/provisioned_hires.json` to durable storage between invocations (e.g. S3/GCS) rather than relying on ephemeral local disk, or a completed hire's state could be lost and steps re-attempted.
-- **Long-running process / container**: use `POLLING_MODE=true`; the graceful-shutdown handling (SIGINT/SIGTERM -> exit `130`) makes this safe to run under a process supervisor or container orchestrator that sends `SIGTERM` on redeploy.
-
-## Production Checklist
-
-- [ ] Deel, Notion, and Slack connectors are ACTIVE in your Scalekit dashboard, with the exact connection names set in `.env`
-- [ ] Deel legal entity and team already exist in your Deel org (this agent does not create them)
-- [ ] Notion parent/hub page is shared with your Notion integration
-- [ ] Slack bot is a member of `SLACK_WELCOME_CHANNEL`
-- [ ] `state/provisioned_hires.json` is on durable, persistent storage for your deployment target
-- [ ] `NEW_HIRE_DRY_RUN=true` was run at least once and the resolved legal entity/team/seniority/details were manually checked before ever setting `NEW_HIRE_DRY_RUN=false` -- Deel has no delete/terminate tool for a direct employee
-- [ ] Google Workspace DWD scopes include all four (`openid`, `userinfo.email`, `userinfo.profile`, `admin.directory.user`), and `GOOGLE_WORKSPACE_USER` is confirmed to be a real Workspace Super Admin -- see [Google Workspace Provisioning](#google-workspace-provisioning-setup-that-was-required)
