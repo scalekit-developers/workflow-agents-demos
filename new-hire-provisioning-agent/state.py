@@ -1,23 +1,17 @@
 """
 State management for idempotency on new-hire provisioning.
 
-Design choice: request-fingerprint, not a scanned-employee-ID set
+Two fingerprint namespaces, one per NEW_HIRE_MODE
 --------------------------------------------------------------------
-The Gusto-based version of this agent scanned for employees that already
-existed in Gusto and tracked which Gusto employee UUIDs had been
-provisioned. Deel has no equivalent "scan for pending hires" concept (see
-config.py's module docstring), so this agent now takes one new hire's
-details directly as input and creates them for real -- the same
-one-request-per-run shape as the sibling pto-leave-request-agent, not a
-scan-and-fan-out loop.
-
-The idempotency question this agent answers is therefore "has THIS exact
-new-hire request already been processed", not "does this Gusto ID already
-exist in my records". Re-running the agent with the same
-first_name+last_name+personal_email+start_date is almost always an accident
-(a retried cron job, a re-run after a transient network error) rather than
-an intentional second hire, so the guard is a straightforward fingerprint,
-matching pto-leave-request-agent's state.py rationale exactly.
+create mode takes one new hire's details directly as input and creates
+them for real in Deel -- the same one-request-per-run shape as the sibling
+pto-leave-request-agent, not a scan-and-fan-out loop. The idempotency
+question it answers is "has THIS exact new-hire request already been
+processed", not "does this ID already exist in my records". Re-running the
+agent with the same first_name+last_name+personal_email+start_date is
+almost always an accident (a retried cron job, a re-run after a transient
+network error) rather than an intentional second hire, so the guard is a
+straightforward fingerprint over those fields (compute_hire_fingerprint).
 
 Deel's org_direct_employee_create has no delete/terminate tool anywhere in
 its catalog (confirmed live, see connectors.py), so re-creating the same
@@ -25,13 +19,23 @@ person by accident is not just a wasted API call -- it is a real, permanent,
 un-undoable duplicate record. This makes the idempotency guard here more
 load-bearing than in agents whose write can be cleanly reversed or retried.
 
-Per-step tracking (deel/workspace/notion/slack) is preserved from the
-Gusto-based version's design: Google Workspace provisioning is expected to
-fail or be skipped independently of Deel/Notion/Slack (see connectors.py
-GoogleWorkspaceConnector and run_flow.py Step 3), so a hire whose Deel
-record, Notion doc, and Slack welcome all succeeded but whose Workspace
-account is still pending should not be silently marked "fully done" and
-never revisited once Workspace provisioning becomes available.
+scan mode detects hires that already have a real Deel contract (via
+deelmcp_onboarding_tracker_list, see connectors.py), so instead of hashing
+name/email/date it fingerprints directly on that real, stable contract ID
+(compute_scan_fingerprint) -- a simpler and equally reliable key, since the
+record's real identity already exists by the time this agent sees it. This
+is a genuinely separate namespace from create mode's hash-based keys; see
+README "State" section for what that means when switching modes for the
+same real hire.
+
+Per-step tracking (deel/workspace/notion/slack in create mode; workspace/
+notion/slack in scan mode, which never creates a Deel record) exists
+because Google Workspace provisioning is expected to fail or be skipped
+independently of the others (see connectors.py GoogleWorkspaceConnector and
+run_flow.py's provision_hire()), so a hire whose Notion doc and Slack
+welcome both succeeded but whose Workspace account is still pending should
+not be silently marked "fully done" and never revisited once Workspace
+provisioning becomes available.
 """
 
 import hashlib
