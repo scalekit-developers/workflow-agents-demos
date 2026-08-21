@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+state/published_releases.json
+.DS_Store
+.coverage
+htmlcov/
