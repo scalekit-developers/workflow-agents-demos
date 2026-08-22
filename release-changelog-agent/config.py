@@ -33,7 +33,7 @@ class Config:
         # (e.g. "github-g0DJbhbx", "confluence-zXIthl0L"), not just the generic
         # provider label. Verified live against this workspace's connections.
         self.github_connector = os.environ.get("GITHUB_CONNECTOR", "github-g0DJbhbx")
-        self.linear_connector = os.environ.get("LINEAR_CONNECTOR", "linear")
+        self.linear_connector = os.environ.get("LINEAR_CONNECTOR", "linear-wuvcVfMm")
         self.confluence_connector = os.environ.get("CONFLUENCE_CONNECTOR", "confluence-zXIthl0L")
         self.notion_connector = os.environ.get("NOTION_CONNECTOR", "notion")
 

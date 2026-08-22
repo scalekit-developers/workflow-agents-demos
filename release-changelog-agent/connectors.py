@@ -251,7 +251,7 @@ class LinearConnector(Connector):
     variables server-side.
     """
 
-    def __init__(self, actions, identifier: str, connector_name: str = "linear"):
+    def __init__(self, actions, identifier: str, connector_name: str = "linear-wuvcVfMm"):
         super().__init__(actions, connector_name, identifier)
 
     def get_issue(self, issue_identifier: str) -> Optional[Dict]:

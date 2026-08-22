@@ -74,7 +74,7 @@ graph TB
 - Python 3.11+
 - A [Scalekit](https://scalekit.com) account (free tier works)
 - A **GitHub** account with read access to the target repo, which must have **at least two tags** (the changelog is a diff between two points)
-- A **Linear** workspace (optional — set `ENABLE_LINEAR=false` to skip)
+- A **Linear** workspace (optional — set `ENABLE_LINEAR=false` to skip). Note the connector's GraphQL responses nest under a `data` key; the connector handles both that and the flat shape.
 - A **Confluence** space you can create pages in (optional — `PUBLISH_CONFLUENCE=false`)
 - A **Notion** page to publish under (optional — `PUBLISH_NOTION=false`)
 
@@ -193,11 +193,10 @@ Built against tool schemas pulled live from the Scalekit environment, not guesse
 - **GitHub** — resolved `v1.1.0...v1.2.0` from real tags on `open-telemetry/opentelemetry-demo`, compared them (26 commits), and hydrated all 26 merged PRs.
 - **Confluence** — space key `SD` resolved to numeric id `294916`, and a real changelog page was created. A second run found the existing page by title and skipped it.
 - **Notion** — a real changelog page was created under a parent page with inline PR links.
-- **Linear** — **not verified end-to-end.** No `LINEAR` connection exists in this Scalekit workspace, so `linear_issue_get` has never been executed against a live issue. The code is written against the tool's published input schema, and the agent degrades cleanly (`ENABLE_LINEAR=false`, or a failed lookup drops just the link). Set up a Linear connection to exercise this path.
+- **Linear** — verified live against connection `linear-wuvcVfMm`. `linear_issue_get` resolved a real issue from its human identifier (`INF-33`) with no UUID lookup, and a nonexistent identifier returned `None` rather than raising. Identifier extraction was exercised from all three sources — PR title, branch name, and body — producing real `linear.app` links in the rendered changelog.
 
 ## Known Limits
 
-- **Linear is unverified** — see above. This is the one integration in this agent that has not run against live data.
 - **Commit-to-PR lookups are capped** at 25 per run. A range with many true merge commits (rather than squash merges) may omit PRs beyond that; the agent warns with the count rather than appearing complete.
 - **Notion duplicate risk** — deleting the state file will create a second Notion page for an already-published version, because Notion titles are not unique enough to check remotely.
 - **`MAX_PRS` caps hydration at 100** (GitHub's `per_page` limit). A release containing more than 100 PRs will resolve their numbers from the compare, but PRs outside the most recent 100 merged are fetched individually, which is slower.
