@@ -101,20 +101,26 @@ def resolve_confluence_space(confluence: ConfluenceConnector, space_key: str) ->
     requires. Raises ProvisioningError listing the visible keys when it misses.
     """
     try:
-        spaces = confluence.list_spaces()
+        space_id = confluence.resolve_space_id(space_key)
     except ConnectorError as e:
         raise ProvisioningError(
             f"Cannot list Confluence spaces: {e}\n"
             f"Confirm CONFLUENCE_CONNECTOR points at an ACTIVE Confluence connection."
         ) from e
 
-    for space in spaces:
-        if str(space.get("key", "")).lower() == space_key.lower():
-            space_id = str(space.get("id"))
-            logger.info(f"[OK] Confluence space '{space_key}' -> id {space_id}")
-            return space_id
+    if space_id:
+        logger.info(f"[OK] Confluence space '{space_key}' -> id {space_id}")
+        return space_id
 
-    visible = ", ".join(str(s.get("key")) for s in spaces if s.get("key")) or "(none visible)"
+    # Re-list only to build a useful error. Naming the keys the account CAN
+    # see is the difference between "not found" and an actionable message.
+    try:
+        visible = ", ".join(
+            str(s.get("key")) for s in confluence.list_spaces() if s.get("key")
+        ) or "(none visible)"
+    except ConnectorError:
+        visible = "(could not list spaces)"
+
     raise ProvisioningError(
         f"Confluence space '{space_key}' not found. Spaces visible to this account: "
         f"{visible}. Set CONFLUENCE_SPACE_KEY to one of them."

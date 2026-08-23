@@ -48,6 +48,7 @@ from connectors import (
 )
 import logging_config
 from changelog import (
+    PR_NUMBER_IN_MESSAGE,
     build_entries,
     extract_pr_numbers_from_commits,
     group_entries,
@@ -125,15 +126,16 @@ def collect_merged_prs(
         logger.info(f"  Compared {previous_tag}...{current_tag}: {len(commits)} commit(s)")
 
         numbers = extract_pr_numbers_from_commits(commits)
-        matched_shas = set()
         for commit in commits:
             message = str((commit.get("commit") or {}).get("message") or "").split("\n", 1)[0]
-            if "(#" not in message:
+            # Use the same regex that extracted the numbers above, so the
+            # "needs a lookup" test cannot disagree with what was parsed. A
+            # loose substring check would treat "fix (#notanumber)" as linked
+            # and silently drop that commit's PR.
+            if not PR_NUMBER_IN_MESSAGE.search(message):
                 sha = commit.get("sha")
                 if sha:
                     unresolved.append(str(sha))
-            else:
-                matched_shas.add(commit.get("sha"))
     except ConnectorError as e:
         logger.warning(
             f"  Could not compare {previous_tag}...{current_tag} ({e}) -- "
@@ -312,13 +314,13 @@ def run_cycle(cfg: Config, actions, state: StateManager) -> Optional[int]:
     repo_label = f"{cfg.github_owner}/{cfg.github_repo}"
 
     logger.info(f"Step 1: Resolving release range for {repo_label}")
-    try:
-        previous_tag, current_tag = resolve_release_range(
-            github, cfg.github_owner, cfg.github_repo, cfg.previous_tag, cfg.current_tag
-        )
-    except ProvisioningError as e:
-        logger.error(str(e))
-        return None
+    # ProvisioningError propagates to main() deliberately: "the release range
+    # could not be resolved" is a configuration failure (exit 1), not an empty
+    # range (exit 2). Collapsing them would make a CI job treat a broken setup
+    # as a quiet no-op.
+    previous_tag, current_tag = resolve_release_range(
+        github, cfg.github_owner, cfg.github_repo, cfg.previous_tag, cfg.current_tag
+    )
 
     if not cfg.release_version:
         cfg.release_version = current_tag
@@ -329,6 +331,13 @@ def run_cycle(cfg: Config, actions, state: StateManager) -> Optional[int]:
     if not prs:
         logger.warning(f"No merged pull requests found between {previous_tag} and {current_tag}")
         return None
+
+    if _shutdown_requested:
+        # collect_merged_prs breaks out of its per-commit lookups on shutdown,
+        # so the PR set here may be partial. Publishing a changelog that
+        # silently omits changes is worse than publishing nothing.
+        logger.warning("Shutdown requested during PR collection -- not publishing a partial changelog")
+        raise KeyboardInterrupt
 
     entries = build_entries(prs, cfg.linear_team_prefixes)
     logger.info(f"  {len(entries)} merged pull request(s) in this release")
@@ -347,6 +356,12 @@ def run_cycle(cfg: Config, actions, state: StateManager) -> Optional[int]:
         logger.info("  No Linear issue identifiers found in these pull requests")
     else:
         logger.info("  Linear enrichment disabled (ENABLE_LINEAR=false)")
+
+    if _shutdown_requested:
+        # enrich_with_linear also breaks early, which would drop issue links
+        # from an otherwise-complete changelog.
+        logger.warning("Shutdown requested during Linear enrichment -- not publishing a partial changelog")
+        raise KeyboardInterrupt
 
     generated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     render_args = dict(
@@ -406,7 +421,11 @@ def main() -> int:
     if not all_active:
         logger.warning("Some connectors are not authorized. Proceeding anyway -- affected steps will be skipped.")
 
-    count = run_cycle(cfg, actions, state)
+    try:
+        count = run_cycle(cfg, actions, state)
+    except ProvisioningError as e:
+        logger.error(str(e))
+        return 1
     if count is None:
         return 2
     logger.info(f"[OK] Changelog covers {count} pull request(s)")

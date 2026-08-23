@@ -72,9 +72,9 @@ class Config:
         )
         self.publish_notion = os.environ.get("PUBLISH_NOTION", "true").lower() == "true"
 
-        # Linear enrichment. Off by default because the LINEAR connector is not
-        # configured in every workspace; when off, the changelog still links
-        # every PR, it just omits the Linear issue column.
+        # Linear enrichment. On by default. When disabled the changelog still
+        # links every PR, it just omits the Linear issue references -- useful
+        # if your workspace has no LINEAR connection configured.
         self.enable_linear = os.environ.get("ENABLE_LINEAR", "true").lower() == "true"
 
         # Regex-ready list of Linear team prefixes (e.g. "ENG,PLAT") used to

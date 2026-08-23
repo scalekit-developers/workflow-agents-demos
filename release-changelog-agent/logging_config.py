@@ -16,7 +16,14 @@ import datetime
 
 
 def _is_tty() -> bool:
-    """Check if stdout is connected to a terminal."""
+    """
+    True when colored output should be emitted.
+
+    Honors FORCE_COLOR=1 so colors survive a pipe -- useful for CI logs that
+    render ANSI. Any other value falls back to a real TTY check.
+    """
+    if os.environ.get("FORCE_COLOR", "").strip() == "1":
+        return True
     return sys.stdout.isatty()
 
 

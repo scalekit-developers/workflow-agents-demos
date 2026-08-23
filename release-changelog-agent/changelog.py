@@ -123,7 +123,9 @@ VERB_HINTS = {
 }
 
 # Squash-merge suffix GitHub appends to commit messages, e.g. "Fix thing (#123)".
-_PR_NUMBER_IN_MESSAGE = re.compile(r"\(#(\d+)\)\s*$")
+# Exported so run_flow uses the same test when deciding which commits still
+# need a per-commit PR lookup, rather than a looser substring check.
+PR_NUMBER_IN_MESSAGE = re.compile(r"\(#(\d+)\)\s*$")
 
 
 @dataclass
@@ -150,12 +152,17 @@ def _linear_pattern(team_prefixes: Optional[List[str]] = None) -> "re.Pattern":
 
     With configured prefixes the match is exact, which avoids false positives
     on things like "UTF-8" or "CVE-2026". With none configured it falls back
-    to any 2-5 letter uppercase prefix, which is the common Linear shape.
+    to any 2-5 character prefix, which is the common Linear shape.
+
+    Both forms match case-insensitively because branch names are conventionally
+    lowercase -- "eng-412-fix-login" is exactly the case where the branch is
+    the only signal, and a case-sensitive fallback would miss it. Identifiers
+    are uppercased by extract_linear_ids, so downstream lookups stay canonical.
     """
     if team_prefixes:
         alternatives = "|".join(re.escape(p.upper()) for p in team_prefixes)
         return re.compile(rf"\b({alternatives})-(\d+)\b", re.IGNORECASE)
-    return re.compile(r"\b([A-Z][A-Z0-9]{1,4})-(\d+)\b")
+    return re.compile(r"\b([A-Za-z][A-Za-z0-9]{1,4})-(\d+)\b")
 
 
 def extract_linear_ids(text: str, team_prefixes: Optional[List[str]] = None) -> List[str]:
@@ -314,7 +321,7 @@ def extract_pr_numbers_from_commits(commits: List[Dict]) -> List[int]:
     for commit in commits:
         message = str(((commit.get("commit") or {}) or {}).get("message") or "")
         first_line = message.split("\n", 1)[0]
-        match = _PR_NUMBER_IN_MESSAGE.search(first_line)
+        match = PR_NUMBER_IN_MESSAGE.search(first_line)
         if match:
             number = int(match.group(1))
             if number not in numbers:
