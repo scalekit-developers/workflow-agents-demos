@@ -28,14 +28,16 @@ class Config:
         self.confluence_user = os.environ.get("CONFLUENCE_USER")
         self.notion_user = os.environ.get("NOTION_USER")
 
-        # Connector names -- must match the exact connection name shown in the
-        # Scalekit dashboard, which is often auto-suffixed per workspace
-        # (e.g. "github-g0DJbhbx", "confluence-zXIthl0L"), not just the generic
-        # provider label. Verified live against this workspace's connections.
-        self.github_connector = os.environ.get("GITHUB_CONNECTOR", "github-g0DJbhbx")
-        self.linear_connector = os.environ.get("LINEAR_CONNECTOR", "linear-wuvcVfMm")
-        self.confluence_connector = os.environ.get("CONFLUENCE_CONNECTOR", "confluence-zXIthl0L")
-        self.notion_connector = os.environ.get("NOTION_CONNECTOR", "notion")
+        # Connector names -- must match the EXACT connection name shown in the
+        # Scalekit dashboard under Agent Auth > Connections. Scalekit
+        # auto-suffixes these per workspace (e.g. "github-a1b2c3d4"), so there
+        # is deliberately no default: a hardcoded guess would point at a
+        # connection that does not exist in the reader's workspace and fail
+        # with a confusing RESOURCE_NOT_FOUND rather than a clear config error.
+        self.github_connector = os.environ.get("GITHUB_CONNECTOR", "")
+        self.linear_connector = os.environ.get("LINEAR_CONNECTOR", "")
+        self.confluence_connector = os.environ.get("CONFLUENCE_CONNECTOR", "")
+        self.notion_connector = os.environ.get("NOTION_CONNECTOR", "")
 
         # Release manager this changelog is attributed to (shown in the footer
         # of the published page and used as the state key).
@@ -100,6 +102,8 @@ class Config:
 
         if not self.github_user:
             errors.append("GITHUB_USER")
+        if not self.github_connector:
+            errors.append("GITHUB_CONNECTOR")
         if not self.release_manager:
             errors.append("RELEASE_MANAGER")
         if not self.github_owner:
@@ -110,10 +114,16 @@ class Config:
         # Only demand an identity for connectors that are actually going to be used.
         if self.enable_linear and not self.linear_user:
             errors.append("LINEAR_USER (or set ENABLE_LINEAR=false)")
+        if self.enable_linear and not self.linear_connector:
+            errors.append("LINEAR_CONNECTOR (or set ENABLE_LINEAR=false)")
         if self.publish_confluence and not self.confluence_user:
             errors.append("CONFLUENCE_USER (or set PUBLISH_CONFLUENCE=false)")
+        if self.publish_confluence and not self.confluence_connector:
+            errors.append("CONFLUENCE_CONNECTOR (or set PUBLISH_CONFLUENCE=false)")
         if self.publish_notion and not self.notion_user:
             errors.append("NOTION_USER (or set PUBLISH_NOTION=false)")
+        if self.publish_notion and not self.notion_connector:
+            errors.append("NOTION_CONNECTOR (or set PUBLISH_NOTION=false)")
 
         if self.publish_confluence and not self.confluence_space_key:
             errors.append("CONFLUENCE_SPACE_KEY (or set PUBLISH_CONFLUENCE=false)")

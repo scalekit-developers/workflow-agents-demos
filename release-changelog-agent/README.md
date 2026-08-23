@@ -106,7 +106,7 @@ In the [Scalekit dashboard](https://scalekit.com), add connections under Agent A
 
 **Notion**: Complete the OAuth flow, and **share the destination page with the integration** — Notion scopes access per page, so an unshared parent page returns "not found" even with a valid token.
 
-**Copy the exact connection names** shown in your dashboard into `.env`. Scalekit auto-suffixes these per workspace (e.g. `github-g0DJbhbx`, `confluence-zXIthl0L`), so the generic provider labels usually will not work.
+**Copy the exact connection names** shown in your dashboard into `.env`. Scalekit auto-suffixes connection names per workspace (e.g. `github-a1b2c3d4`, `confluence-e5f6g7h8`), so the generic provider labels usually will not work — check yours under Agent Auth > Connections.
 
 ### 4. Run
 
@@ -143,7 +143,7 @@ Four passes, most reliable signal first. Each falls through only when the previo
 3. **PR labels** — `bug`, `enhancement`, `documentation`.
 4. **Leading imperative verb** — `Fix grafana datasource URL`, `Add Splunk`. Deliberately conservative: only unambiguous verbs are listed, and a component scope like `[shippingservice]` is stripped first so the verb is actually the first word.
 
-Anything still unclassified lands in **Other Changes** rather than being guessed at. On a real 26-PR release in `open-telemetry/opentelemetry-demo`, this produced 10 features, 4 fixes, 5 chores, and 7 genuinely ambiguous entries — versus 26 in one bucket with Conventional Commits parsing alone.
+Anything still unclassified lands in **Other Changes** rather than being guessed at.
 
 Breaking changes (`!` marker or a "BREAKING CHANGE" note) are listed in a leading section *and* kept in their own category, so a breaking feature still reads as a feature.
 
@@ -155,18 +155,6 @@ Linear's `issue(id:)` resolver accepts the human identifier directly, so no sepa
 
 Set `LINEAR_TEAM_PREFIXES=ENG,PLAT` to make matching exact and avoid false positives on strings like `UTF-8` or `CVE-2026`.
 
-## Idempotency
-
-A version is published at most once per repository per target.
-
-| Target | Guard | Survives state deletion? |
-|---|---|---|
-| Confluence | Local state + **remote title search** in the space | ✅ |
-| Notion | Local state only | ❌ |
-
-The asymmetry is real and deliberate: Confluence page titles are unique within a space, so an existing page can be found reliably. **Notion titles are not unique**, so there is no equivalent remote check — deleting `state/published_releases.json` and re-running *will* create a second Notion page. Verified live.
-
-State is recorded per target, so a run that publishes to Confluence and then fails on Notion records the Confluence page and does not recreate it on retry.
 
 ## Usage
 
@@ -186,35 +174,27 @@ PUBLISH_NOTION=false python run_flow.py               # Confluence only
 | 2 | No data — no merged pull requests in the resolved range |
 | 130 | Interrupted (Ctrl+C or SIGTERM) |
 
-## Verification Status
+## Troubleshooting
 
-**All four services verified in a single end-to-end run** against `parv15/changelog-demo`, a small public repo built for this purpose (two tags, three squash-merged PRs referencing Linear issues from the title, the branch name, and the body respectively):
-
-```
-Resolved release range v0.1.0...v0.2.0 from repo tags
-Compared v0.1.0...v0.2.0: 3 commit(s)
-Grouped: 1 feature, 1 fix, 1 chore
-Linked 3/3 Linear issue reference(s)
-[OK] Published to Confluence
-[OK] Published to Notion
-```
-
-The published Confluence page was read back through the API and contains 3 GitHub PR links and 3 `linear.app` issue links. A second run skipped both targets.
-
-
-Built against tool schemas pulled live from the Scalekit environment, not guessed. Verified end-to-end against real services:
-
-- **GitHub** — resolved `v1.1.0...v1.2.0` from real tags on `open-telemetry/opentelemetry-demo`, compared them (26 commits), and hydrated all 26 merged PRs.
-- **Confluence** — space key `SD` resolved to numeric id `294916`, and a real changelog page was created. A second run found the existing page by title and skipped it.
-- **Notion** — a real changelog page was created under a parent page with inline PR links.
-- **Linear** — verified live against connection `linear-wuvcVfMm`. `linear_issue_get` resolved a real issue from its human identifier (`INF-33`) with no UUID lookup, and a nonexistent identifier returned `None` rather than raising. Identifier extraction was exercised from all three sources — PR title, branch name, and body — producing real `linear.app` links in the rendered changelog.
-
-## Known Limits
-
-- **Commit-to-PR lookups are capped** at 25 per run. A range with many true merge commits (rather than squash merges) may omit PRs beyond that; the agent warns with the count rather than appearing complete.
-- **Notion duplicate risk** — deleting the state file will create a second Notion page for an already-published version, because Notion titles are not unique enough to check remotely.
-- **`MAX_PRS` caps hydration at 100** (GitHub's `per_page` limit). A release containing more than 100 PRs will resolve their numbers from the compare, but PRs outside the most recent 100 merged are fetched individually, which is slower.
-- **No release-notes generation from commit bodies** — the changelog summarises PR titles, not diffs. It does not attempt to describe what changed beyond what the author wrote.
+| Issue | Solution |
+|-------|----------|
+| `ModuleNotFoundError: scalekit` | Run `pip install -r requirements.txt` |
+| `Missing required config: ...` | Run `cp .env.example .env` and fill in your values |
+| `connector (...) -- EXPIRED` / `PENDING_AUTH` | Open the auth link printed in the Step 0 logs, or authorize in the Scalekit dashboard |
+| `Missing required config: GITHUB_CONNECTOR` | Connector names have no default. Copy the exact connection name from Agent Auth > Connections — Scalekit auto-suffixes it per workspace (e.g. `github-a1b2c3d4`), so the generic `GITHUB` label will not work |
+| `multiple connected accounts found for identifier` | Set the exact `*_CONNECTOR` env var for that provider; the same identifier is connected to more than one connection of that type in your workspace |
+| `... has no tags, so there is no release baseline` | The repo has never been tagged. Tag a release, or set `PREVIOUS_TAG` and `CURRENT_TAG` explicitly |
+| `... has only one tag` / `'X' is the oldest tag` | There is no earlier tag to diff against. Set `PREVIOUS_TAG` explicitly |
+| `CURRENT_TAG 'X' not found` | The tag does not exist in that repo. The error lists the recent tags it did find |
+| `No merged pull requests found between ...` (exit 2) | The range is genuinely empty, or the repo merges without squashing. Commits lacking a `(#123)` suffix are resolved via a per-commit lookup capped at 25 — the log says how many were skipped |
+| Everything lands in **Other Changes** | The repo uses no recognised title convention. Grouping falls back through Conventional Commits, `[type]` prefixes, PR labels, then leading verbs; unrecognised titles stay in Other by design rather than being guessed at |
+| `No Linear issue identifiers found in these pull requests` | Expected when PRs do not reference Linear. Identifiers are read from the PR title, branch name, and body — set `LINEAR_TEAM_PREFIXES=ENG,PLAT` to match exactly and avoid false positives like `UTF-8` |
+| Linear links missing for a PR that does reference an issue | The lookup failed (typo'd, deleted, or not visible to the connected account). A failed lookup drops the link, never the changelog entry |
+| `Confluence space 'X' not found` | The error lists the space keys visible to your account. `CONFLUENCE_SPACE_KEY` is the human key from the URL (e.g. `SD`), not the numeric id — the agent resolves that for you |
+| Confluence page created but blank | `body_representation` and `body_value` must both be sent; the connector omits the body entirely if either is missing. Check for local edits to `ConfluenceConnector.create_page` |
+| A second Notion page appeared for the same version | Expected if `state/published_releases.json` was deleted. Notion page titles are not unique, so it has no remote duplicate check — Confluence does |
+| Notion publish fails with "not found" | Share the parent page with the Notion integration; Notion scopes access per page, so a valid token alone is not enough |
+| `No colored output` | Colors auto-disable when output is piped; force with `FORCE_COLOR=1` |
 
 ## Project Structure
 
@@ -230,3 +210,4 @@ release-changelog-agent/
 ├── requirements.txt
 └── .env.example
 ```
+

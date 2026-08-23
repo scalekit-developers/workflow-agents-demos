@@ -8,7 +8,7 @@ Tool names and parameter shapes below are verified live against this
 workspace's Scalekit environment (env_20324953475777334) at build time -- not
 guessed. The four shapes most likely to bite are called out explicitly:
 
-  - github_tags_list(owner=..., repo=..., per_page=...)          (GITHUB, "github-g0DJbhbx")
+  - github_tags_list(owner=..., repo=..., per_page=...)          (GITHUB connector)
   - github_release_get_latest(owner=..., repo=...)               (GITHUB)
       NOTE: 404s on repos that tag without cutting GitHub Releases, so tag
       resolution falls back to github_tags_list -- verified live against a
@@ -21,13 +21,13 @@ guessed. The four shapes most likely to bite are called out explicitly:
       NOTE: the API has no "merged" filter -- state="closed" includes closed
       -but-never-merged PRs, so callers MUST filter on merged_at themselves.
 
-  - linear_issue_get(issueId="ENG-123")                          (LINEAR, "linear")
+  - linear_issue_get(issueId="ENG-123")                          (LINEAR connector)
       NOTE: GraphQL under the hood; Linear's issue(id:) resolver accepts a
       human identifier as well as a UUID, so "ENG-123" works directly. The
       baked-in selection set does NOT include the `identifier` field, so the
       caller keeps the identifier it searched with.
 
-  - confluence_space_list(keys=[...], limit=...)                 (CONFLUENCE, "confluence-zXIthl0L")
+  - confluence_space_list(keys=[...], limit=...)                 (CONFLUENCE connector)
       -> {"results": [{"id": "294916", "key": "SD", ...}]}
       NOTE: confluence_page_create needs the NUMERIC space id, not the key.
   - confluence_page_create(spaceId=..., title=..., parentId=...,
@@ -37,7 +37,7 @@ guessed. The four shapes most likely to bite are called out explicitly:
       sent at all.
 
   - notion_page_create(parent_page_id=..., properties={...},
-        child_blocks=[<raw notion blocks>])                      (NOTION, "notion")
+        child_blocks=[<raw notion blocks>])                      (NOTION connector)
   - notion_page_content_append(block_id=..., blocks=[{"type","text"}])  (NOTION)
       NOTE: these two take DIFFERENT block formats. child_blocks is the raw
       Notion block object shape; blocks is a simplified {type, text} shape
@@ -168,7 +168,7 @@ class Connector:
 class GitHubConnector(Connector):
     """GitHub API operations -- resolve release tags and collect merged PRs."""
 
-    def __init__(self, actions, identifier: str, connector_name: str = "github-g0DJbhbx"):
+    def __init__(self, actions, identifier: str, connector_name: str = "github"):
         super().__init__(actions, connector_name, identifier)
 
     def latest_release_tag(self, owner: str, repo: str) -> Optional[str]:
@@ -251,7 +251,7 @@ class LinearConnector(Connector):
     variables server-side.
     """
 
-    def __init__(self, actions, identifier: str, connector_name: str = "linear-wuvcVfMm"):
+    def __init__(self, actions, identifier: str, connector_name: str = "linear"):
         super().__init__(actions, connector_name, identifier)
 
     def get_issue(self, issue_identifier: str) -> Optional[Dict]:
@@ -279,7 +279,7 @@ class LinearConnector(Connector):
 class ConfluenceConnector(Connector):
     """Confluence API operations -- resolve a space and publish the changelog page."""
 
-    def __init__(self, actions, identifier: str, connector_name: str = "confluence-zXIthl0L"):
+    def __init__(self, actions, identifier: str, connector_name: str = "confluence"):
         super().__init__(actions, connector_name, identifier)
 
     def list_spaces(self, limit: int = 250) -> List[Dict]:
