@@ -188,6 +188,20 @@ PUBLISH_NOTION=false python run_flow.py               # Confluence only
 
 ## Verification Status
 
+**All four services verified in a single end-to-end run** against `parv15/changelog-demo`, a small public repo built for this purpose (two tags, three squash-merged PRs referencing Linear issues from the title, the branch name, and the body respectively):
+
+```
+Resolved release range v0.1.0...v0.2.0 from repo tags
+Compared v0.1.0...v0.2.0: 3 commit(s)
+Grouped: 1 feature, 1 fix, 1 chore
+Linked 3/3 Linear issue reference(s)
+[OK] Published to Confluence
+[OK] Published to Notion
+```
+
+The published Confluence page was read back through the API and contains 3 GitHub PR links and 3 `linear.app` issue links. A second run skipped both targets.
+
+
 Built against tool schemas pulled live from the Scalekit environment, not guessed. Verified end-to-end against real services:
 
 - **GitHub** — resolved `v1.1.0...v1.2.0` from real tags on `open-telemetry/opentelemetry-demo`, compared them (26 commits), and hydrated all 26 merged PRs.
