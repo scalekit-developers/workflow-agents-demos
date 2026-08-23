@@ -196,18 +196,3 @@ PUBLISH_NOTION=false python run_flow.py               # Confluence only
 | Notion publish fails with "not found" | Share the parent page with the Notion integration; Notion scopes access per page, so a valid token alone is not enough |
 | `No colored output` | Colors auto-disable when output is piped; force with `FORCE_COLOR=1` |
 
-## Project Structure
-
-```
-release-changelog-agent/
-├── run_flow.py          # Orchestration: the 4-step pipeline
-├── config.py            # Env-var config with fail-fast validation
-├── connectors.py        # GitHub / Linear / Confluence / Notion via Scalekit
-├── changelog.py         # Classification, grouping, and the three renderers
-├── provisioning.py      # Tag-range and Confluence-space resolution
-├── state.py             # Published-version state (idempotency)
-├── logging_config.py    # Structured logging with secret redaction
-├── requirements.txt
-└── .env.example
-```
-
