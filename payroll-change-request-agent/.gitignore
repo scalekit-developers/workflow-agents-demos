@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+state/processed_changes.json
+.DS_Store
