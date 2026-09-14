@@ -4,13 +4,19 @@ sk_gateway.py - Scalekit AgentKit MCP Gateway Provisioning
 Builds the pieces of a working Hermes <-> AgentKit gateway connection:
 
 1. A connected account for the GitHub connector (one-time user authorization).
-2. An MCP config that maps that connection to a narrow set of tools.
-3. A per-user MCP instance (its own MCP server URL).
-4. A short-lived session token to authenticate Hermes's requests to that URL.
+2. An MCP config that maps that connection to a narrow set of tools. This
+   config exposes one static mcp_server_url, shared by every identity that
+   gets a session token minted against it.
+3. A short-lived session token, scoped to one identifier, that authenticates
+   Hermes's requests to that shared URL.
 
 This is the layer Hermes Agent's config.yaml ultimately points at — Hermes
 never sees a GitHub token, only a Scalekit-issued MCP session token that
-expires and gets re-minted, same as any other bearer credential.
+expires and gets re-minted, same as any other bearer credential. There is no
+per-user MCP instance in the current model: ensure_instance() still exists in
+the SDK but isn't part of this flow, isolation between identities lives
+entirely in the session token's claims (sub, ca_ids), not in a separate URL
+per person.
 
 All calls here go through client.actions / client.actions.mcp, the same
 typed action layer documented in Scalekit's AgentKit quickstart.
@@ -41,8 +47,7 @@ class GatewayResult:
     authorization_link: Optional[str]
     mcp_config_id: str
     mcp_config_name: str
-    mcp_server_url: str  # config-level URL (shared shape for this config)
-    instance_url: str  # per-user instance URL — this is what Hermes should call
+    mcp_server_url: str  # the one URL Hermes should call, shared across identities
     session_token: str
     session_token_expires_at: str
 
@@ -129,23 +134,7 @@ class ScalekitGateway:
         return cfg.id, cfg.mcp_server_url or ""
 
     # ------------------------------------------------------------------
-    # Step 3: per-user MCP instance
-    # ------------------------------------------------------------------
-    def ensure_instance(self, config_id: str, identifier: str) -> str:
-        """Ensure a per-user MCP instance exists; return its endpoint URL."""
-        result = self.client.actions.mcp.ensure_instance(
-            config_name=Settings.MCP_CONFIG_NAME,
-            user_identifier=identifier,
-        )
-        instance = result.instance
-        logger.info(
-            "gateway.mcp_instance_ready id=%s user=%s url=%s",
-            instance.id, instance.user_identifier, instance.url,
-        )
-        return instance.url or ""
-
-    # ------------------------------------------------------------------
-    # Step 4: session token for Hermes to authenticate with
+    # Step 3: session token for Hermes to authenticate with
     # ------------------------------------------------------------------
     def mint_session_token(self, config_id: str, identifier: str) -> tuple[str, str]:
         """Mint a bearer token Hermes's config.yaml can use against the instance URL."""
@@ -164,10 +153,9 @@ class ScalekitGateway:
     # Orchestration
     # ------------------------------------------------------------------
     def provision(self, identifier: str) -> GatewayResult:
-        """Run all four steps and return everything Hermes needs."""
+        """Run all three steps and return everything Hermes needs."""
         status, auth_link = self.ensure_connected_account(identifier)
         config_id, config_url = self.ensure_mcp_config()
-        instance_url = self.ensure_instance(config_id, identifier)
 
         # A session token is only meaningful once the connected account is
         # active — minting one earlier just gives Hermes a token that will
@@ -181,7 +169,6 @@ class ScalekitGateway:
             mcp_config_id=config_id,
             mcp_config_name=Settings.MCP_CONFIG_NAME,
             mcp_server_url=config_url,
-            instance_url=instance_url,
             session_token=token,
             session_token_expires_at=expires_at,
         )

@@ -23,7 +23,7 @@ from unittest.mock import MagicMock
 import pytest
 
 # Ensure required env vars exist before settings.py is imported anywhere.
-os.environ.setdefault("SCALEKIT_ENV_URL", "https://test-env.scalekit.com")
+os.environ.setdefault("SCALEKIT_ENVIRONMENT_URL", "https://test-env.scalekit.com")
 os.environ.setdefault("SCALEKIT_CLIENT_ID", "skc_test")
 os.environ.setdefault("SCALEKIT_CLIENT_SECRET", "test_secret")
 os.environ.setdefault("SCALEKIT_GITHUB_CONNECTION", "github")
@@ -137,21 +137,6 @@ class TestMcpConfig:
         assert mapping.tools == ["github_search_issues", "github_issue_labels_add", "github_issue_get"]
 
 
-class TestMcpInstance:
-    def test_ensure_instance_returns_url(self, gateway):
-        response = MagicMock()
-        response.instance = _make_mcp_instance()
-        gateway.client.actions.mcp.ensure_instance.return_value = response
-
-        url = gateway.ensure_instance("cfg_123", "test-user@example.com")
-
-        assert url == "https://test-env.scalekit.com/mcp/cfg_123/inst_abc"
-        gateway.client.actions.mcp.ensure_instance.assert_called_once_with(
-            config_name="hermes-github-gateway-test",
-            user_identifier="test-user@example.com",
-        )
-
-
 class TestSessionToken:
     def test_mint_session_token(self, gateway):
         response = MagicMock()
@@ -179,10 +164,6 @@ class TestFullProvisioning:
         list_response.configs = [_make_mcp_config()]
         gateway.client.actions.mcp.list_configs.return_value = list_response
 
-        instance_response = MagicMock()
-        instance_response.instance = _make_mcp_instance()
-        gateway.client.actions.mcp.ensure_instance.return_value = instance_response
-
         token_response = MagicMock()
         token_response.token = "sk_mcp_session_xyz"
         token_response.expires_at = datetime(2026, 9, 4, 12, 0, 0)
@@ -193,7 +174,7 @@ class TestFullProvisioning:
         assert result.connected_account_status == "ACTIVE"
         assert result.authorization_link is None
         assert result.mcp_config_id == "cfg_123"
-        assert result.instance_url == "https://test-env.scalekit.com/mcp/cfg_123/inst_abc"
+        assert result.mcp_server_url == "https://test-env.scalekit.com/mcp/cfg_123"
         assert result.session_token == "sk_mcp_session_xyz"
 
 
@@ -203,13 +184,13 @@ class TestHermesConfigSnippet:
     def test_snippet_is_valid_yaml_with_expected_shape(self, tmp_path):
         import yaml
 
-        instance_url = "https://test-env.scalekit.com/mcp/cfg_123/inst_abc"
+        config_url = "https://test-env.scalekit.com/mcp/cfg_123"
         token = "sk_mcp_session_xyz"
         tools = ["github_search_issues", "github_issue_labels_add", "github_issue_get"]
 
         snippet = f"""mcp_servers:
   github_gateway:
-    url: "{instance_url}"
+    url: "{config_url}"
     headers:
       Authorization: "Bearer {token}"
     tools:
@@ -220,7 +201,7 @@ class TestHermesConfigSnippet:
         parsed = yaml.safe_load(snippet)
 
         server = parsed["mcp_servers"]["github_gateway"]
-        assert server["url"] == instance_url
+        assert server["url"] == config_url
         assert server["headers"]["Authorization"] == f"Bearer {token}"
         assert server["tools"]["include"] == tools
         assert server["tools"]["prompts"] is False
