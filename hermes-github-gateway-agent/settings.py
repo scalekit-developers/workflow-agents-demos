@@ -31,7 +31,7 @@ class Settings:
     # ============================================================================
 
     # Scalekit environment URL (e.g., https://your-env.scalekit.com)
-    SCALEKIT_ENV_URL: str = os.getenv("SCALEKIT_ENV_URL", "")
+    SCALEKIT_ENV_URL: str = os.getenv("SCALEKIT_ENVIRONMENT_URL", os.getenv("SCALEKIT_ENV_URL", ""))
 
     # Scalekit OAuth client credentials (from your Scalekit dashboard)
     SCALEKIT_CLIENT_ID: str = os.getenv("SCALEKIT_CLIENT_ID", "")
@@ -87,7 +87,7 @@ class Settings:
         """Raise a clear error for anything required that's missing."""
         missing = []
         if not cls.SCALEKIT_ENV_URL:
-            missing.append("SCALEKIT_ENV_URL")
+            missing.append("SCALEKIT_ENVIRONMENT_URL")
         if not cls.SCALEKIT_CLIENT_ID:
             missing.append("SCALEKIT_CLIENT_ID")
         if not cls.SCALEKIT_CLIENT_SECRET:

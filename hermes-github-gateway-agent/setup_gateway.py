@@ -4,10 +4,11 @@ setup_gateway.py - Step-by-step provisioning of the Hermes <-> AgentKit gateway
 
 Run this once to:
   1. Create (or reuse) a connected account for GitHub, tied to HERMES_USER_IDENTIFIER.
-  2. Create (or reuse) an MCP config that maps that connection to a narrow tool list.
-  3. Ensure a per-user MCP instance exists (its own MCP server URL).
-  4. Mint a session token Hermes can use to authenticate to that URL.
-  5. Write a ready-to-paste mcp_servers block to hermes_mcp_config.snippet.yaml.
+  2. Create (or reuse) an MCP config that maps that connection to a narrow tool
+     list. This config exposes one static mcp_server_url.
+  3. Mint a session token, scoped to this identifier, that Hermes can use to
+     authenticate to that URL.
+  4. Write a ready-to-paste mcp_servers block to hermes_mcp_config.snippet.yaml.
 
 If the connected account isn't ACTIVE yet, this script prints an authorization
 link, waits for you to approve it, and re-checks before minting the token —
@@ -55,7 +56,7 @@ def main() -> int:
 
     gateway = ScalekitGateway()
 
-    _print_step(1, 4, "Checking connected account...")
+    _print_step(1, 3, "Checking connected account...")
     status, auth_link = gateway.ensure_connected_account(identifier)
     print(f"      status = {status}")
     if status.lower() != "active":
@@ -69,21 +70,18 @@ def main() -> int:
             return 1
     print("      ✓ connected account is ACTIVE")
 
-    _print_step(2, 4, "Ensuring MCP config...")
+    _print_step(2, 3, "Ensuring MCP config...")
     config_id, config_url = gateway.ensure_mcp_config()
     print(f"      config_id = {config_id}")
+    print(f"      mcp_server_url = {config_url}")
 
-    _print_step(3, 4, "Ensuring per-user MCP instance...")
-    instance_url = gateway.ensure_instance(config_id, identifier)
-    print(f"      instance_url = {instance_url}")
-
-    _print_step(4, 4, "Minting session token for Hermes...")
+    _print_step(3, 3, "Minting session token for Hermes...")
     token, expires_at = gateway.mint_session_token(config_id, identifier)
     print(f"      expires_at = {expires_at}")
 
     snippet = f"""mcp_servers:
   github_gateway:
-    url: "{instance_url}"
+    url: "{config_url}"
     headers:
       Authorization: "Bearer {token}"
     tools:

@@ -41,7 +41,7 @@ pip install -r requirements.txt
 pip install hermes-agent
 
 cp .env.example .env
-# fill in SCALEKIT_ENV_URL, SCALEKIT_CLIENT_ID, SCALEKIT_CLIENT_SECRET,
+# fill in SCALEKIT_ENVIRONMENT_URL, SCALEKIT_CLIENT_ID, SCALEKIT_CLIENT_SECRET,
 # and SCALEKIT_GITHUB_CONNECTION (the connection name from your dashboard)
 ```
 
