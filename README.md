@@ -1,6 +1,6 @@
 # 🔧 Scalekit Agent Action Examples
 
-This repository contains a collection of **Scalekit agent action** examples, demonstrating how to implement workflow automation and integrations across different applications. Scalekit provides production-ready connectors so you can integrate services like **Slack, GitHub, Gmail, Google Calendar, Notion, and more** with minimal effort.
+This repository contains a collection of **Scalekit agent action** examples, demonstrating how to implement workflow automation and integrations across different applications. Scalekit provides auth and actions on behalf of users, with 500+ connectors and 20,000+ tools. The examples use Slack, GitHub, Gmail, Google Calendar, and Notion.
 
 Explore how to integrate **agent actions and workflows** into your applications using Scalekit.
 
